@@ -1,0 +1,6 @@
+{
+  "name": "model-router",
+  "version": "0.2.0",
+  "description": "Uses Haiku to pick Opus, Sonnet or Haiku for each sub-agent",
+  "types": "./types/index.d.ts"
+}

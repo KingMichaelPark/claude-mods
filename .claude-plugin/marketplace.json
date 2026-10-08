@@ -7,6 +7,10 @@
     {
       "name": "usage-meter",
       "source": "./usage-meter"
+    },
+    {
+      "name": "model-router",
+      "source": "./model-router"
     }
   ]
 }
