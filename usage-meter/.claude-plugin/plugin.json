@@ -1,0 +1,6 @@
+{
+  "name": "usage-meter",
+  "version": "0.3.0",
+  "description": "Minimal band: model, context tokens and estimated session cost, coloured by context fill",
+  "types": "./types/index.d.ts"
+}
