@@ -11,6 +11,10 @@
     {
       "name": "model-router",
       "source": "./model-router"
+    },
+    {
+      "name": "rex-approve",
+      "source": "./rex-approve"
     }
   ]
 }
