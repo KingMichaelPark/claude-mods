@@ -44,11 +44,78 @@ code_only() {
 
 blank() { [[ -z ${1//[[:space:]]/} ]] }
 
+# Reports this pane's state to Rex with the Program Status Protocol (OSC 7501).
+# "blocked" lights the tab, plays Rex's blocked sound, and sends a macOS
+# notification when Rex is in the background (all per Rex's Settings >
+# Notifications > Program Activity). "clear" removes the report.
+#   rex_status blocked <kind> <message> | rex_status clear
+b64() { print -rn -- "$1" | base64 | tr -d '\n' }
+rex_status() {
+  if [[ $1 == clear ]]; then
+    printf '\e]7501;state=clear:app=rex-approve\e\\'
+    return
+  fi
+  # One line, no control characters, kept well under the 2048-byte limit.
+  local msg=${${(f)3}[1]}
+  msg=${msg//[[:cntrl:]]/ }
+  (( ${#msg} > 200 )) && msg="${msg[1,200]}…"
+  printf '\e]7501;state=%s:kind=%s:app=rex-approve:title=%s:msg=%s\e\\' \
+    "$1" "$2" "$(b64 'Claude needs approval')" "$(b64 "$msg")"
+}
+trap 'rex_status clear' EXIT
+
+# Whether $cmd fits on screen for vared. zle can't show a buffer taller than
+# the terminal, so a longer one is printed in full instead (scrollable) and
+# edited in $EDITOR.
+fits() {
+  local -i rows=0 h=24 w=80
+  local size line
+  size=$(stty size 2>/dev/null) && { h=${size% *}; w=${size#* } }
+  (( w > 0 )) || w=80
+  for line in "${(@f)cmd}"; do
+    (( rows += (${#line} + 2) / w + 1 ))  # +2 for the "❯ " prompt
+  done
+  (( rows <= h - 2 ))
+}
+
+editor=${VISUAL:-${EDITOR:-vi}}
+
+# For a command too tall for vared: shows all of it, then Enter runs it,
+# e edits it in $editor, Ctrl-C or n cancels.
+confirm_long() {
+  local key
+  for (( ;; )); do
+    print -P "%F{cyan}❯%f"
+    print -r -- "$cmd"
+    print
+    print -P "%F{8}Too long to edit in place. Scroll up to read all of it.%f"
+    print -P "%F{8}Enter runs it. %F{cyan}e%F{8} edits it in ${editor//\%/%%}. Ctrl-C or %F{cyan}n%F{8} cancels.%f"
+    key=''
+    while [[ -z $key ]]; do
+      read -k1 -s key || cancel
+      case $key in
+        $'\n'|$'\r') return 0 ;;
+        n|N) cancel ;;
+        e|E)
+          print -r -- "$cmd" >| $dir/edit.zsh
+          ${=editor} $dir/edit.zsh </dev/tty >/dev/tty
+          cmd=$(<$dir/edit.zsh)
+          rm -f $dir/edit.zsh
+          blank "$cmd" && cancel
+          print
+          ;;
+        *) key='' ;;
+      esac
+    done
+  done
+}
+
 # Runs $cmd, bracketed by markers the mod uses to cut each command's output
 # out of the capture.
 run_one() {
   (( runs++ ))
   print -r -- "$cmd" >| $dir/run.$runs.cmd
+  rex_status clear  # the command may report its own status
   trap ': ' INT  # Ctrl-C interrupts the command, not this wrapper
   print -P "%F{8}⟦rex-approve:${id}:begin:${runs}⟧%f"
   ( eval "$cmd" )
@@ -64,16 +131,23 @@ run_one() {
 print -P "%B%F{yellow}Claude wants to run a command that needs your approval%f%b"
 [[ -n $why ]] && print -P "%F{8}${why//\%/%%}%f"
 print -P "%F{8}cwd: ${PWD//\%/%%}%f"
-print -P "%F{8}Enter runs it here. Edit it first if you like. Ctrl-C or an empty line cancels.%f"
-print
+rex_status blocked permission "$cmd"
 
 trap cancel INT
-vared -e -p '%F{cyan}❯%f ' cmd || cancel
+if fits; then
+  print -P "%F{8}Enter runs it here. Edit it first if you like. Ctrl-C or an empty line cancels.%f"
+  print
+  vared -e -p '%F{cyan}❯%f ' cmd || cancel
+else
+  print
+  confirm_long
+fi
 blank "$cmd" && cancel
 run_one
 
 share=''
 while [[ -z $share ]]; do
+  rex_status blocked question "Choose what to send Claude"
   print -P "%BWhat next?%b"
   print -P "  %F{cyan}k%f  keep going: run a follow-on command here"
   print -P "  %F{cyan}y%f  send Claude the captured output"

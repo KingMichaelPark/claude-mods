@@ -1,5 +1,5 @@
 {
   "name": "rex-approve",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Approve Bash commands by running them yourself in a Rex pane, then choose what Claude sees"
 }
