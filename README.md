@@ -114,9 +114,12 @@ that waits for a message). The tab also reports its state to Rex with the Progra
 tab and notify you when an agent finishes or fails.
 
 The agent still runs inside Claude Code. Its result, `SendMessage`, and model routing work as before; the tab only shows
-the work. If you send a message to a finished agent, it continues in the same tab. Nested agents get their own tabs.
+the work. If you send a message to a finished agent, it continues in the same tab, or in a new tab if that tab has
+closed. Nested agents get their own tabs.
 
-A tab stays open after the agent ends. Close it when you have read it. Closing a tab does not stop the agent. The viewer
+When an agent finishes without errors, its tab closes itself after 5 seconds. Press any key in the tab during the
+countdown to keep it open. The tab of an agent that fails or is interrupted stays open. Teammate tabs also stay open.
+To keep all tabs open, run `/rex autoclose off`. Closing a tab does not stop the agent. The viewer
 script (`scripts/agent-view.zsh`) reads events from a temporary folder, and deletes the folder when you close the tab.
 
 ### Background Command Tabs
@@ -171,6 +174,7 @@ exit codes and your choice to a temporary folder, and the plugin deletes it afte
 ```bash
 /rex status               # Show the settings and whether this is a Rex terminal
 /rex agents on|off        # A Rex tab for each sub-agent (default on)
+/rex autoclose on|off     # Close a sub-agent's tab 5s after it finishes (default on)
 /rex bg on|off            # A Rex tab for each background command (default on)
 /rex approve unsandboxed  # Commands that leave the sandbox and need approval open in a pane (default)
 /rex approve ask          # Every Bash command that needs approval opens in a pane

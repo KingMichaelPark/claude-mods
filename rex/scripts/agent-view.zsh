@@ -6,14 +6,19 @@
 # prints them in order as they arrive, so the tab is a live log of the agent.
 #
 #   state   working | idle | done | error | aborted (the agent's loop now)
-#   title   the agent's short description, for Rex's status reports
+#   title      the agent's short description, for Rex's status reports
+#   autoclose  seconds to wait before the tab closes itself once the agent
+#              is done (absent or 0: the tab stays open)
 #
-# The tab stays open after the agent ends: a message from SendMessage can
-# resume it, and its events then carry on in the same tab. Close the tab when
-# you've read it; the run directory is removed with it.
+# When the agent finishes cleanly and autoclose is set, the tab counts down and
+# closes; press any key in it to keep it open. A failed or interrupted agent's
+# tab stays open. A message from SendMessage can resume an agent: its events
+# carry on in the same tab, or in a new one if this one has closed. The run
+# directory is removed with the tab.
 
 emulate -L zsh
 setopt no_beep extended_glob
+zmodload -F zsh/datetime p:EPOCHSECONDS
 
 dir=$1
 [[ -d $dir ]] || { print -u2 "rex: missing agent directory"; exit 2 }
@@ -22,6 +27,8 @@ trap 'exit 0' INT TERM HUP
 
 title=''
 [[ -r $dir/title ]] && title=$(<$dir/title)
+integer autoclose=0
+[[ -r $dir/autoclose ]] && autoclose=$(<$dir/autoclose)
 
 # Reports the agent's state to Rex with the Program Status Protocol (OSC 7501),
 # so the tab shows it is working, finished, or failed.
@@ -48,7 +55,7 @@ report() {
   esac
 }
 
-integer n=1
+integer n=1 deadline=0 kept=0
 shown=''
 for (( ;; )); do
   # Events are printed strictly in order: one written out of order waits for
@@ -65,7 +72,21 @@ for (( ;; )); do
   if [[ $state != $shown ]]; then
     report $state
     shown=$state
+    deadline=0
+    if [[ $state == done ]] && (( autoclose > 0 && ! kept )); then
+      deadline=$(( EPOCHSECONDS + autoclose ))
+      print -P "%F{8}Closing this tab in ${autoclose}s. Press any key to keep it open.%f"
+    fi
   fi
   [[ -d $dir ]] || exit 0
-  sleep 0.25
+  if (( deadline )); then
+    (( EPOCHSECONDS >= deadline )) && exit 0
+    # A key pressed during the countdown keeps the tab open.
+    if read -t 0.25 -k1 -s _key; then
+      deadline=0 kept=1
+      print -P "%F{8}Keeping this tab open.%f"
+    fi
+  else
+    sleep 0.25
+  fi
 done

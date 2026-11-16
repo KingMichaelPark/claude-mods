@@ -15,6 +15,8 @@ import type { EngineInterface, Register } from "claude-code";
 // its final report. The tab's name and Rex status show whether it is working,
 // finished or failed. The agent still runs inside Claude Code, so results,
 // SendMessage and model routing work as before; the tab only shows the work.
+// A tab whose agent finishes cleanly closes itself after a short countdown
+// (press a key in it to keep it); a failed or interrupted agent's tab stays.
 
 type On = Parameters<Register>[0];
 
@@ -22,6 +24,9 @@ type Mode = "ask" | "unsandboxed" | "off";
 const MODES: readonly Mode[] = ["ask", "unsandboxed", "off"];
 const MODE_KEY = "approve.mode";
 const TABS_KEY = "tabs";
+const AUTOCLOSE_KEY = "agents.autoclose";
+// Seconds a finished agent's tab waits before it closes itself.
+const AUTOCLOSE_S = 5;
 
 // How long one `rex wait` runs before we look at next.signal again.
 const WAIT_SLICE_S = 15;
@@ -226,6 +231,11 @@ const tabsOn = async ($: EngineInterface) =>
         | string
         | undefined) !== "off";
 
+const autocloseOn = async ($: EngineInterface) =>
+    ((await $.store.get(AUTOCLOSE_KEY).catch(() => undefined)) as
+        | string
+        | undefined) !== "off";
+
 // The most of a prompt, a text or a report shown in a tab.
 const MAX_BLOCK_CHARS = 8_000;
 // The most of a tool call's input shown on its line.
@@ -394,6 +404,9 @@ const openTab = async (
     if (made.exitCode !== 0 || dir === "") throw new Error("mktemp failed");
     await $.fs.write(`${dir}/title`, title);
     await $.fs.write(`${dir}/state`, "working");
+    // Teammates go idle between turns rather than finishing, so never close.
+    if (!teammate && (await autocloseOn($)))
+        await $.fs.write(`${dir}/autoclose`, String(AUTOCLOSE_S));
     const label = oneLine(title, MAX_LABEL_CHARS);
     const tab: AgentTab = {
         dir,
@@ -440,6 +453,10 @@ const registerAgentTabs = (on: On) => {
         if (agentId === undefined) return res;
         try {
             const known = tabs.get(agentId);
+            // A tab that closed itself (or that you closed) takes its
+            // directory with it: a resumed agent then gets a new tab.
+            if (known && !known.gone && !(await $.fs.exists(known.dir)))
+                known.gone = true;
             if (e.resume && known && !known.gone) {
                 void emit(
                     $,
@@ -545,7 +562,9 @@ const registerAgentTabs = (on: On) => {
         const usage = e.usage
             ? ` · ${e.usage.input_tokens + e.usage.cache_read_input_tokens + e.usage.cache_creation_input_tokens} in / ${e.usage.output_tokens} out tokens`
             : "";
-        void emit(
+        // Awaited: the report must be written before the state that may
+        // start the tab's close countdown.
+        await emit(
             $,
             tab,
             [
@@ -668,6 +687,18 @@ const endBgTab = async (
 
 const NOTIFICATION = /<task-notification>([\s\S]*?)<\/task-notification>/g;
 
+// Marks the end of each tracked background task a notification text reports.
+const endBgTabsFrom = async ($: EngineInterface, raw: string) => {
+    if (bgTabs.size === 0 || !raw.includes("task-notification")) return;
+    for (const [, body = ""] of raw.matchAll(NOTIFICATION)) {
+        const id = /<task-id>([^<]+)<\/task-id>/.exec(body)?.[1];
+        const status = /<status>([^<]+)<\/status>/.exec(body)?.[1];
+        if (!id || !status || !bgTabs.has(id)) continue;
+        const code = /exit code (\d+)/.exec(body)?.[1];
+        await endBgTab($, id, status, code).catch(() => undefined);
+    }
+};
+
 const registerBgTabs = (on: On) => {
     on("tool.call", { tool: "Bash" }, async ($, e, next) => {
         const res = await next(e);
@@ -692,27 +723,29 @@ const registerBgTabs = (on: On) => {
     }).catch(($, e, next) => next(e)); // the tab is only a view
 
     // A background task's end reaches the conversation as a notification,
-    // which carries its status and exit code.
+    // which carries its status and exit code. It is submitted as a prompt
+    // (origin task-notification), then appended to the session. Both are
+    // hooked: an organisation's plugin can send session.append on past this
+    // mod's hook. endBgTab forgets a task once handled, so it runs once.
+    on("prompt.submit", async ($, e, next) => {
+        if (e.origin.kind === "task-notification")
+            await endBgTabsFrom($, e.text).catch(() => undefined);
+
+        return next(e);
+    }).catch(($, e, next) => next(e));
+
     on("session.append", async ($, e, next) => {
-        if (bgTabs.size > 0) {
-            const raw = JSON.stringify(e.message.content);
-            if (raw.includes("<task-notification>"))
-                for (const [, body = ""] of raw.matchAll(NOTIFICATION)) {
-                    const id = /<task-id>([^<]+)<\/task-id>/.exec(body)?.[1];
-                    const status = /<status>([^<]+)<\/status>/.exec(body)?.[1];
-                    if (!id || !status || !bgTabs.has(id)) continue;
-                    const code = /exit code (\d+)/.exec(body)?.[1];
-                    await endBgTab($, id, status, code).catch(() => undefined);
-                }
-        }
+        if (bgTabs.size > 0)
+            await endBgTabsFrom($, JSON.stringify(e.message.content));
 
         return next(e);
     }).catch(($, e, next) => next(e));
 };
 
 const HELP = [
-    "Usage: /rex [status | agents <on|off> | bg <on|off> | approve <mode>]",
+    "Usage: /rex [status | agents <on|off> | autoclose <on|off> | bg <on|off> | approve <mode>]",
     "  agents on|off        a Rex tab for each sub-agent, to watch it work (default on)",
+    `  autoclose on|off     close a sub-agent's tab ${AUTOCLOSE_S}s after it finishes cleanly (default on)`,
     "  bg on|off            a Rex tab for each background command, following its output (default on)",
     "  approve unsandboxed  commands that leave the sandbox and need approval open in a Rex pane (default)",
     "  approve ask          every Bash command that needs approval (not for auto mode)",
@@ -724,6 +757,7 @@ const statusText = async ($: EngineInterface) => {
 
     return [
         `rex agents: ${(await tabsOn($)) ? "on" : "off"}`,
+        `rex autoclose: ${(await autocloseOn($)) ? "on" : "off"}`,
         `rex bg: ${(await bgOn($)) ? "on" : "off"}`,
         `rex approve: ${await getMode($)}`,
         ...(inRex ? [] : ["(not in a Rex terminal, so inactive)"]),
@@ -739,7 +773,8 @@ export const register: Register = (on) => {
             name: "rex",
             description:
                 "Rex tabs for sub-agents and background commands, and Rex approvals",
-            argumentHint: "[status|agents on|off|bg on|off|approve <mode>]",
+            argumentHint:
+                "[status|agents on|off|autoclose on|off|bg on|off|approve <mode>]",
         });
         showStatus($, await getMode($));
 
@@ -757,10 +792,16 @@ export const register: Register = (on) => {
             return { text: `rex approve set to ${value}.` };
         }
         if (
-            (what === "agents" || what === "bg") &&
+            (what === "agents" || what === "bg" || what === "autoclose") &&
             (value === "on" || value === "off")
         ) {
-            await $.store.set(what === "agents" ? TABS_KEY : BG_KEY, value);
+            const key =
+                what === "agents"
+                    ? TABS_KEY
+                    : what === "bg"
+                      ? BG_KEY
+                      : AUTOCLOSE_KEY;
+            await $.store.set(key, value);
 
             return { text: `rex ${what} ${value}.` };
         }
