@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Runs inside a Rex pane opened by the rex-approve mod.
+# Runs inside a Rex pane opened by the rex mod.
 #
 # Shows the command Claude wants to run, prefilled and editable. Enter runs it
 # here, in this terminal, as you. Ctrl-C (or an empty line) cancels. After it
@@ -21,7 +21,7 @@ setopt no_beep
 
 dir=$1
 id=${2:-x}
-[[ -d $dir && -r $dir/command ]] || { print -u2 "rex-approve: missing run directory"; exit 2 }
+[[ -d $dir && -r $dir/command ]] || { print -u2 "rex: missing run directory"; exit 2 }
 
 cmd=$(<$dir/command)
 why=''
@@ -117,10 +117,10 @@ run_one() {
   print -r -- "$cmd" >| $dir/run.$runs.cmd
   rex_status clear  # the command may report its own status
   trap ': ' INT  # Ctrl-C interrupts the command, not this wrapper
-  print -P "%F{8}⟦rex-approve:${id}:begin:${runs}⟧%f"
+  print -P "%F{8}⟦rex:${id}:begin:${runs}⟧%f"
   ( eval "$cmd" )
   local rc=$?
-  print -P "%F{8}⟦rex-approve:${id}:end:${runs}⟧%f"
+  print -P "%F{8}⟦rex:${id}:end:${runs}⟧%f"
   print -r -- $rc >| $dir/run.$runs.rc
   print -r -- $runs >| $dir/runs
   trap code_only INT

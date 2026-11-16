@@ -11,7 +11,7 @@ into session consumption and automatically optimize your token usage and API cos
 | ------------------------------------ | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
 | [**`usage-meter`**](#-usage-meter)   | Real-time prompt header displaying model, context window capacity, and session cost. | Color-coded context fill alerts & instant post-compaction estimates.                                |
 | [**`model-router`**](#-model-router) | Autonomous model routing for spawned sub-agents based on task complexity.            | Keeps the main thread on your preferred model while routing sub-tasks to the cheapest capable tier. |
-| [**`rex-approve`**](#-rex-approve)   | Approve unsandboxed Bash commands by running them yourself in a Rex pane.            | You choose what Claude sees afterwards: the output, the exit code only, or your own summary.        |
+| [**`rex`**](#️-rex)                   | Rex terminal integration: approve Bash commands in a pane, watch sub-agents in tabs. | Each sub-agent gets a live Rex tab; for approvals, you choose what Claude sees afterwards.          |
 
 ---
 
@@ -90,7 +90,52 @@ Latest decisions (model, why, agent):
 
 ---
 
-## 🖥️ `rex-approve`
+## 🖥️ `rex`
+
+[Rex](https://www.superlogical.com/rex/docs) terminal integration with three features: **agent tabs**, **background command tabs** and
+**approvals**. They only work when Claude Code runs in a Rex terminal (`REX_SESSION` and `REX_BLOCK` are set). Elsewhere the plugin
+does nothing.
+
+### Agent Tabs
+
+Each sub-agent that Claude starts gets its own tab in Claude's Rex session, so you can watch the agents work without
+switching views in Claude Code. The tab opens in the background and does not take focus.
+
+Each tab shows a live log of the agent:
+
+- A header with the agent's description, type, model, and whether it runs in the foreground or background.
+- The prompt that Claude gave the agent.
+- Each tool call (`▸ Grep pattern in src`) and its result (`✓ Grep · 12 lines · 0.4s`, or `✗` with the error).
+- The text the agent writes between tool calls.
+- The agent's final report, with its duration and token counts.
+
+The tab name shows the agent's state: `◐` working, `✓` finished, `✗` failed, `■` interrupted, `◇` idle (a teammate
+that waits for a message). The tab also reports its state to Rex with the Program Status Protocol, so Rex can light the
+tab and notify you when an agent finishes or fails.
+
+The agent still runs inside Claude Code. Its result, `SendMessage`, and model routing work as before; the tab only shows
+the work. If you send a message to a finished agent, it continues in the same tab. Nested agents get their own tabs.
+
+A tab stays open after the agent ends. Close it when you have read it. Closing a tab does not stop the agent. The viewer
+script (`scripts/agent-view.zsh`) reads events from a temporary folder, and deletes the folder when you close the tab.
+
+### Background Command Tabs
+
+Each Bash command that Claude runs in the background gets its own tab, which follows the command's output live. This
+includes a command that you move to the background with Ctrl+B, or that Claude Code moves there when it times out. Use
+it to watch dev servers, builds and test runs that Claude starts.
+
+- Claude Code still runs the command, in its sandbox. The tab only shows the output file, so the sandbox, `TaskStop`,
+  completion notifications and Claude's own reads of the output work as before.
+- The tab name shows the state: `◐` running, `✓` exited 0, `✗` failed or exited with another code, `■` stopped. When the
+  command ends, the tab shows its exit code (from Claude Code's completion notification).
+- **Ctrl-C** in the tab asks whether to stop the command. On `y`, it sends `SIGTERM` to every process that holds the
+  output file open: the command and the children that write to it. Claude is then told that the command ended.
+- Closing the tab stops only the watching, not the command.
+
+The viewer script is `scripts/bg-view.zsh`. It uses `tail -F` on the output file and `lsof` to see when the command ends.
+
+### Approvals
 
 When Claude wants to run a Bash command that leaves the sandbox and needs your approval, this plugin opens a
 [Rex](https://www.superlogical.com/rex/docs) pane below Claude's with the command prefilled. You read it and run it
@@ -121,16 +166,18 @@ pane cannot be opened, you get the normal approval dialog.
 The command output is never written to a file. The pane script (`scripts/approve.zsh`) writes only the commands, their
 exit codes and your choice to a temporary folder, and the plugin deletes it afterwards.
 
-### Slash Commands (`/rex-approve`)
+### Slash Commands (`/rex`)
 
 ```bash
-/rex-approve unsandboxed  # Commands that leave the sandbox and need approval open in a pane (default)
-/rex-approve ask          # Every Bash command that needs approval opens in a pane
-/rex-approve off          # Use the normal approval dialog
-/rex-approve status       # Show the current mode and whether this is a Rex terminal
+/rex status               # Show the settings and whether this is a Rex terminal
+/rex agents on|off        # A Rex tab for each sub-agent (default on)
+/rex bg on|off            # A Rex tab for each background command (default on)
+/rex approve unsandboxed  # Commands that leave the sandbox and need approval open in a pane (default)
+/rex approve ask          # Every Bash command that needs approval opens in a pane
+/rex approve off          # Use the normal approval dialog
 ```
 
-Do not use `ask` in auto mode. The plugin checks permissions before the auto-mode classifier runs, so `ask` sends you
+Do not use `approve ask` in auto mode. The plugin checks permissions before the auto-mode classifier runs, so `ask` sends you
 commands that the classifier would have approved.
 
 ### Notes
@@ -161,11 +208,13 @@ claude-mods/
 │   │   └── router.test.ts    # Comprehensive test suite
 │   └── types/
 │       └── index.d.ts        # TypeScript declarations & state augmentations
-├── rex-approve/
+├── rex/
 │   ├── hooks/
 │   │   ├── hooks.json        # Hook entrypoints (register.ts)
-│   │   └── register.ts       # Bash interception, Rex pane control & /rex-approve
+│   │   └── register.ts       # Agent & background tabs, approvals & /rex
 │   └── scripts/
+│       ├── agent-view.zsh    # Runs in each agent's Rex tab: prints its live log
+│       ├── bg-view.zsh       # Runs in each background command's tab: follows its output
 │       └── approve.zsh       # Runs in the Rex pane: prompt, run, follow-ons, share choice
 └── usage-meter/
     ├── hooks/
@@ -190,7 +239,7 @@ Add this repository directory as a plugin source in your Claude Code configurati
 # Add this directory as a plugin marketplace or install individual plugins
 claude plugin add ./model-router
 claude plugin add ./usage-meter
-claude plugin add ./rex-approve
+claude plugin add ./rex
 ```
 
 #### Option B: Project Configuration
@@ -203,7 +252,7 @@ To enable these plugins automatically for a specific project, you can reference 
   "plugins": [
     "/path/to/claude-mods/model-router",
     "/path/to/claude-mods/usage-meter",
-    "/path/to/claude-mods/rex-approve"
+    "/path/to/claude-mods/rex"
   ]
 }
 ```
@@ -212,7 +261,7 @@ To enable these plugins automatically for a specific project, you can reference 
 
 ## 🧪 Running Tests
 
-`model-router` and `usage-meter` include test suites using the `claude-code/testing` framework. `rex-approve` has none
+`model-router` and `usage-meter` include test suites using the `claude-code/testing` framework. `rex` has none
 yet; it was tested by hand in a Rex terminal.
 
 - **`model-router/hooks/router.test.ts`**: Verifies routing logic, explicit model overrides, fork handling, toast
@@ -225,6 +274,6 @@ yet; it was tested by hand in a Rex terminal.
 ## 🛠️ Requirements
 
 - **Claude Code** CLI
-- For `rex-approve`: the [Rex](https://www.superlogical.com/rex/docs) terminal with its `rex` CLI on your `PATH`, and
+- For `rex`: the [Rex](https://www.superlogical.com/rex/docs) terminal with its `rex` CLI on your `PATH`, and
   `zsh` at `/bin/zsh`
 - Nerd Font or Unicode-compatible terminal (for model icon `󱜙` and cost icon ``)

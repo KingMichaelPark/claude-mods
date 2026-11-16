@@ -13,8 +13,8 @@
       "source": "./model-router"
     },
     {
-      "name": "rex-approve",
-      "source": "./rex-approve"
+      "name": "rex",
+      "source": "./rex"
     }
   ]
 }
