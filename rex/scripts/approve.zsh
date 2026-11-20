@@ -1,10 +1,11 @@
 #!/bin/zsh
 # Runs inside a Rex pane opened by the rex mod.
 #
-# Shows the command Claude wants to run. You can run it as it is, edit it
-# first, or cancel. It runs here, in this terminal, as you, one time. The
-# result goes back to Claude. In auto mode the pane then closes; otherwise it
-# stays open for you to read and close.
+# Runs a command Claude wants to run, here, in this terminal, as you, one
+# time, and the result goes back to Claude. You approve it in Claude's own
+# chat, which runs it here at once, or you choose to edit it here first. With
+# rex auto on (/rex auto on) it runs with no question and the pane closes
+# itself; otherwise the pane stays open for you to read and close.
 #
 # Ctrl-C at any point (before the command runs, while it runs, or after it)
 # sends nothing: the mod ends Claude's turn and Claude waits for you.
@@ -12,15 +13,14 @@
 # The mod puts these files in $1 for the wrapper to read:
 #   command        the command Claude proposed
 #   description    Claude's description of it (optional)
-#   automode       present when Claude Code is in auto mode
-#   autorun        present when you chose auto-run in auto mode: the command
-#                  runs at once, with no questions
+#   runnow         present when the command is approved already (in the chat,
+#                  or by rex auto): it runs at once, with no questions
+#   autoclose      present when rex auto is on: the pane closes itself after
 # The wrapper writes these files in $1 for the mod to read:
 #   status         ran | cancelled (not run) | stopped (Ctrl-C after it started)
 #   run.cmd        the command as you ran it (it can be edited)
 #   rc             its exit status
 #   note           a note you typed for Claude (optional)
-#   always         present when you chose "auto-run from now on in auto mode"
 # The output is not written to a file. The mod reads it with
 # `rex block capture`.
 
@@ -34,18 +34,18 @@ id=${2:-x}
 cmd=$(<$dir/command)
 why=''
 [[ -r $dir/description ]] && why=$(<$dir/description)
-automode=0
-[[ -e $dir/automode ]] && automode=1
-autorun=0
-[[ -e $dir/autorun ]] && autorun=1
+runnow=0
+[[ -e $dir/runnow ]] && runnow=1
+autoclose=0
+[[ -e $dir/autoclose ]] && autoclose=1
 
 finish() {
   print -r -- $1 >| $dir/status
-  # In auto mode the mod reads this pane's output, then closes it and removes
-  # $dir. If it has not done so after a while (it was reloaded, or its hook
-  # was stopped), the pane closes itself. Out of auto mode, a pane whose
-  # command ran stays open for you to read and close.
-  if (( automode )) && [[ -n $REX_BLOCK ]] && (( $+commands[rex] )); then
+  # With rex auto on, the mod reads this pane's output, then closes it and
+  # removes $dir. If it has not done so after a while (it was reloaded, or its
+  # hook was stopped), the pane closes itself. Otherwise a pane whose command
+  # ran stays open for you to read and close.
+  if (( autoclose )) && [[ -n $REX_BLOCK ]] && (( $+commands[rex] )); then
     ( sleep 20; [[ -d $dir ]] && rex block close $REX_BLOCK ) >/dev/null 2>&1 &!
   fi
   exit 0
@@ -121,8 +121,7 @@ edit_inline() {
   vared -e -p '%F{cyan}❯%f ' cmd || cancel
 }
 
-# A one-key menu. Used in auto mode (for the auto-run choice) and for commands
-# too tall to edit in place. Returns when the command must run.
+# A one-key menu, for commands too tall to edit in place. Returns when the command must run.
 choose() {
   local key long
   for (( ;; )); do
@@ -138,7 +137,6 @@ choose() {
     else
       print -P "  %F{cyan}e%f      edit it here (Enter then runs it)"
     fi
-    (( automode )) && print -P "  %F{cyan}a%f      run it, and auto-run all commands from now on in auto mode"
     print -P "  %F{cyan}n%f      cancel (or Ctrl-C)"
     key=''
     while [[ -z $key ]]; do
@@ -146,13 +144,6 @@ choose() {
       case $key in
         $'\n'|$'\r') return 0 ;;
         n|N) cancel ;;
-        a|A)
-          if (( automode )); then
-            : >| $dir/always
-            return 0
-          fi
-          key=''
-          ;;
         e|E)
           print
           if (( long )); then
@@ -219,19 +210,23 @@ offer_note() {
   fi
 }
 
-print -P "%B%F{yellow}Claude wants to run a command that needs your approval%f%b"
+if (( runnow )); then
+  print -P "%B%F{yellow}Claude is running a command you approved%f%b"
+else
+  print -P "%B%F{yellow}Edit the command Claude wants to run%f%b"
+fi
 [[ -n $why ]] && print -P "%F{8}${why//\%/%%}%f"
 print -P "%F{8}cwd: ${PWD//\%/%%}%f"
 
-if (( autorun )); then
-  print -P "%F{8}Auto mode: it runs without asking. %F{cyan}/rex approve auto off%F{8} stops this.%f"
+if (( runnow )); then
+  (( autoclose )) && print -P "%F{8}rex auto is on: it runs without asking. %F{cyan}/rex auto off%F{8} stops this.%f"
   print -P "%F{cyan}❯%f"
   print -r -- "$cmd"
   print
 else
   rex_status blocked permission "$cmd"
   trap cancel INT
-  if (( automode )) || ! fits; then
+  if ! fits; then
     print
     choose
   else
@@ -243,8 +238,8 @@ else
 fi
 
 run_it
-(( autorun )) || offer_note
-if (( automode )); then
+(( runnow )) || offer_note
+if (( autoclose )); then
   print -P "%F{8}Sent to Claude. This pane closes now.%f"
 else
   print -P "%F{8}Sent to Claude. Close this pane when you're done with it.%f"

@@ -4,14 +4,16 @@ import type { EngineInterface, Register } from "claude-code";
 // when Claude runs in a Rex terminal (the third is below, at registerBgTabs:
 // a tab that follows each background command's output):
 //
-// Approvals. When a Bash call would stop for your approval, this mod opens a
-// Rex pane below Claude's with the command prefilled instead. You read it,
-// edit it if you like, and run it there yourself, one time. Claude gets the
-// exit code and the output, and any note you add. If you cancel, or press
-// Ctrl-C at any point, Claude gets nothing: its turn ends and it waits for you.
-// In auto mode you can choose to auto-run these commands: the pane then runs
-// each one at once. In auto mode the pane closes itself once the command
-// ends; otherwise it stays open so you can read the output.
+// Approvals. When a Bash call would stop for your approval, this mod asks you
+// in Claude's own chat instead, and runs the command you approve in a Rex pane
+// below Claude's, as you, one time (or opens it there for you to edit first).
+// Claude gets the exit code and the output, and any note you add. If you say
+// no, or press Ctrl-C at any point, Claude gets nothing: its turn ends and it
+// waits for you. The pane stays open so you can read the output.
+//
+// rex auto (/rex auto on) is a switch of its own, apart from Claude Code's
+// auto mode: with it on, these commands run in the pane with no question and
+// the pane closes itself when the command ends.
 //
 // Agent tabs. Each sub-agent Claude starts gets its own Rex tab in Claude's
 // session: a live log of its prompt, its text, every tool call and result, and
@@ -26,7 +28,8 @@ type On = Parameters<Register>[0];
 type Mode = "ask" | "unsandboxed" | "off";
 const MODES: readonly Mode[] = ["ask", "unsandboxed", "off"];
 const MODE_KEY = "approve.mode";
-// "on": in auto mode, approval panes run the command at once, without asking.
+// "on": rex auto. Approval panes run the command at once, without asking, and
+// close themselves. Not Claude Code's auto mode, which it does not read.
 const AUTORUN_KEY = "approve.autorun";
 const TABS_KEY = "tabs";
 const AUTOCLOSE_KEY = "agents.autoclose";
@@ -53,11 +56,13 @@ type Outcome =
           exitCode: string;
           output: string;
           note: string;
-          auto: boolean;
+          how: How;
       };
 
-// Claude Code's permission mode, as the last classic hook input carried it.
-let permissionMode: string | undefined;
+// How a command that ran was approved: by rex auto, in the chat, or in the
+// pane (after editing it there).
+type How = "auto" | "chat" | "pane";
+
 // The main loop's running turn, which a cancelled approval ends.
 let mainTurnId: string | undefined;
 
@@ -150,7 +155,7 @@ const readOutcome = async (
     paneId: string,
     dir: string,
     id: string,
-    auto: boolean,
+    how: How,
 ): Promise<Outcome> => {
     const status = await readFile($, `${dir}/status`);
     if (status === "cancelled") return { kind: "cancelled" };
@@ -178,14 +183,14 @@ const readOutcome = async (
                 ? sliceOutput(cap.stdout, id, 1, MAX_OUTPUT_CHARS)
                 : "(the pane could not be captured)",
         note: await readFile($, `${dir}/note`),
-        auto,
+        how,
     };
 };
 
 const describe = (o: Outcome, proposed: string): string => {
     switch (o.kind) {
         case "cancelled":
-            return "The user reviewed this command in a Rex terminal pane and chose not to run it. Stop and wait for the user's direction.";
+            return "The user reviewed this command and chose not to run it. Stop and wait for the user's direction.";
         case "stopped":
             return "The user stopped this command with Ctrl-C in the Rex terminal pane and chose not to share the result. Stop and wait for the user's direction.";
         case "closed":
@@ -195,9 +200,12 @@ const describe = (o: Outcome, proposed: string): string => {
         case "interrupted":
             return "The turn was interrupted while the Rex approval pane was open; the command was not run.";
         case "ran": {
-            const who = o.auto
-                ? "This command ran automatically in a Rex terminal pane (the user chose auto-run in auto mode)."
-                : "The user ran this command themselves in a Rex terminal pane.";
+            const who =
+                o.how === "auto"
+                    ? "This command ran automatically in a Rex terminal pane (the user turned on rex auto)."
+                    : o.how === "chat"
+                      ? "The user approved this command and it ran in a Rex terminal pane, as the user."
+                      : "The user ran this command themselves in a Rex terminal pane.";
             const lines = [`${who} Exit code: ${o.exitCode || "unknown"}.`];
             if (o.command && o.command !== proposed.trim())
                 lines.push(
@@ -734,14 +742,14 @@ const registerBgTabs = (on: On) => {
 };
 
 const HELP = [
-    "Usage: /rex [status | agents <on|off> | autoclose <on|off> | bg <on|off> | approve <mode> | approve auto <on|off>]",
+    "Usage: /rex [status | agents <on|off> | autoclose <on|off> | bg <on|off> | approve <mode> | auto <on|off>]",
     "  agents on|off        a Rex tab for each sub-agent, to watch it work (default on)",
     `  autoclose on|off     close a sub-agent's tab ${AUTOCLOSE_S}s after it finishes cleanly (default on)`,
     "  bg on|off            a Rex tab for each background command, following its output (default on)",
-    "  approve unsandboxed  commands that leave the sandbox and need approval open in a Rex pane (default)",
-    "  approve ask          every Bash command that needs approval (not for auto mode)",
+    "  approve unsandboxed  commands that leave the sandbox and need approval: you approve in the chat, they run in a Rex pane (default)",
+    "  approve ask          the same for every Bash command that needs approval",
     "  approve off          use the normal approval dialog",
-    "  approve auto on|off  in auto mode, approval panes run the command at once (default off)",
+    "  auto on|off          rex auto: those commands run in a Rex pane with no question, and the pane closes itself (default off; separate from Claude Code's auto mode)",
 ].join("\n");
 
 const statusText = async ($: EngineInterface) => {
@@ -752,7 +760,7 @@ const statusText = async ($: EngineInterface) => {
         `rex autoclose: ${(await autocloseOn($)) ? "on" : "off"}`,
         `rex bg: ${(await bgOn($)) ? "on" : "off"}`,
         `rex approve: ${await getMode($)}`,
-        `rex approve auto-run (auto mode): ${(await autorunOn($)) ? "on" : "off"}`,
+        `rex auto: ${(await autorunOn($)) ? "on" : "off"}`,
         ...(inRex ? [] : ["(not in a Rex terminal, so inactive)"]),
     ].join("\n");
 };
@@ -761,30 +769,13 @@ export const register: Register = (on) => {
     registerAgentTabs(on);
     registerBgTabs(on);
 
-    // The permission mode reaches mods on the classic hooks' inputs. These
-    // fire often enough to follow a mode change (Shift+Tab) within a turn.
-    on("classic.SessionStart", ($, e, next) => {
-        permissionMode = e.permission_mode ?? permissionMode;
-
-        return next(e);
-    });
-    on("classic.UserPromptSubmit", ($, e, next) => {
-        permissionMode = e.permission_mode ?? permissionMode;
-
-        return next(e);
-    });
-    on("classic.PostToolUse", ($, e, next) => {
-        permissionMode = e.permission_mode ?? permissionMode;
-
-        return next(e);
-    });
     on("session.start", async ($, e, next) => {
         await $.command.register({
             name: "rex",
             description:
                 "Rex tabs for sub-agents and background commands, and Rex approvals",
             argumentHint:
-                "[status|agents on|off|autoclose on|off|bg on|off|approve <mode>|approve auto on|off]",
+                "[status|agents on|off|autoclose on|off|bg on|off|approve <mode>|auto on|off]",
         });
         showStatus($, await getMode($));
 
@@ -798,10 +789,22 @@ export const register: Register = (on) => {
             .split(/\s+/);
         if (what === "" || what === "status")
             return { text: `${await statusText($)}\n\n${HELP}` };
-        if (what === "approve" && value === "auto" && (extra === "on" || extra === "off")) {
-            await $.store.set(AUTORUN_KEY, extra);
+        // `approve auto on|off` is the older spelling of `auto on|off`.
+        const autoSwitch =
+            what === "auto"
+                ? value
+                : what === "approve" && value === "auto"
+                  ? extra
+                  : "";
+        if (autoSwitch === "on" || autoSwitch === "off") {
+            await $.store.set(AUTORUN_KEY, autoSwitch);
 
-            return { text: `rex approve auto-run in auto mode ${extra}.` };
+            return {
+                text:
+                    autoSwitch === "on"
+                        ? "rex auto on: approval commands run in a Rex pane with no question, and the pane closes itself."
+                        : "rex auto off: you approve each command in the chat, and its pane stays open.",
+            };
         }
         if (what === "approve" && isMode(value)) {
             await $.store.set(MODE_KEY, value);
@@ -850,6 +853,56 @@ export const register: Register = (on) => {
         if (verdict.decision !== "ask") return next(e);
         const input = { description: e.description };
 
+        // Ends the main turn, so Claude waits for you. A sub-agent's call is
+        // refused instead, and the agent is told to stop.
+        const endTurn = async () => {
+            if (e.agentId === undefined && mainTurnId !== undefined)
+                await $.turn
+                    .abort({ turnId: mainTurnId })
+                    .catch(() => undefined);
+        };
+
+        // The approval itself stays in the chat. rex auto skips it.
+        const auto = await autorunOn($);
+        let how: How = auto ? "auto" : "chat";
+        if (!auto) {
+            const RUN = "Run it in a Rex pane";
+            const RUN_AUTO = "Run it, and turn on rex auto";
+            const EDIT = "Edit it in a Rex pane first";
+            const NO = "Don't run it";
+            let answer: string;
+            try {
+                answer = await $.ui.ask(
+                    [
+                        input.description || "Claude wants to run a command that needs your approval.",
+                        "",
+                        command,
+                        "",
+                        "Run it in a Rex pane, as you?",
+                    ].join("\n"),
+                    { header: "rex approve", options: [RUN, RUN_AUTO, EDIT, NO] },
+                );
+            } catch {
+                answer = NO; // dismissed
+            }
+            if (answer === RUN_AUTO) {
+                await $.store.set(AUTORUN_KEY, "on");
+                $.ui.log("rex auto on: approval commands now run with no question (/rex auto off to stop)");
+            }
+            if (answer === EDIT) how = "pane";
+            else if (answer !== RUN && answer !== RUN_AUTO) {
+                if (answer === NO) {
+                    await endTurn();
+
+                    return { deny: describe({ kind: "cancelled" }, command) };
+                }
+                // Text typed under "Other": not run, and Claude reads why.
+                return {
+                    deny: `The user did not run this command. They said:\n${answer}`,
+                };
+            }
+        }
+
         // Set up the pane. Anything failing up to here falls back to the normal dialog.
         let dir: string;
         let paneId: string;
@@ -866,10 +919,8 @@ export const register: Register = (on) => {
             await $.fs.write(`${dir}/command`, command);
             if (input.description)
                 await $.fs.write(`${dir}/description`, input.description);
-            if (permissionMode === "auto") {
-                await $.fs.write(`${dir}/automode`, "");
-                if (await autorunOn($)) await $.fs.write(`${dir}/autorun`, "");
-            }
+            if (how !== "pane") await $.fs.write(`${dir}/runnow`, "");
+            if (how === "auto") await $.fs.write(`${dir}/autoclose`, "");
             const id = dir.split("/").pop() ?? "x";
             const split = await rex($, [
                 "split",
@@ -909,12 +960,15 @@ export const register: Register = (on) => {
 
         // From here on the command may have run, so never fall back to next(e).
         const id = dir.split("/").pop() ?? "x";
-        $.ui.status("rex approve: waiting for you in the Rex pane");
-        // In auto mode the pane closes once its output is read, before anything
-        // that can end the turn (and this hook with it). Out of auto mode, a
+        $.ui.status(
+            how === "pane"
+                ? "rex approve: waiting for you in the Rex pane"
+                : "rex approve: running in the Rex pane",
+        );
+        // With rex auto on, the pane closes once its output is read, before
+        // anything that can end the turn (and this hook with it). Otherwise a
         // pane whose command ran (or was stopped) stays open for you to read
         // and close; one where nothing ran still closes.
-        const inAutoMode = await $.fs.exists(`${dir}/automode`);
         let paneClosed = false;
         let keepPane = false;
         const closePane = async () => {
@@ -925,20 +979,13 @@ export const register: Register = (on) => {
             );
         };
         try {
-            const auto = await $.fs.exists(`${dir}/autorun`);
             const waited = await waitForPane($, r, paneId, dir, next.signal);
-            if (await $.fs.exists(`${dir}/always`)) {
-                await $.store.set(AUTORUN_KEY, "on");
-                $.ui.log(
-                    "rex: approval panes now auto-run in auto mode (/rex approve auto off to stop)",
-                );
-            }
             const outcome: Outcome =
                 waited === "done" || waited === "gone"
-                    ? await readOutcome($, r, paneId, dir, id, auto)
+                    ? await readOutcome($, r, paneId, dir, id, how)
                     : { kind: waited };
             keepPane =
-                !inAutoMode &&
+                how !== "auto" &&
                 (outcome.kind === "ran" || outcome.kind === "stopped");
             await closePane();
             const text = describe(outcome, command);
@@ -947,13 +994,8 @@ export const register: Register = (on) => {
                 outcome.kind === "stopped" ||
                 outcome.kind === "closed"
             ) {
-                // Back to the prompt: end the main turn, so Claude waits for
-                // you. A sub-agent's call is refused instead, and the agent is
-                // told to stop.
-                if (e.agentId === undefined && mainTurnId !== undefined)
-                    await $.turn
-                        .abort({ turnId: mainTurnId })
-                        .catch(() => undefined);
+                // Back to the prompt: Claude waits for you.
+                await endTurn();
 
                 return { deny: text };
             }
