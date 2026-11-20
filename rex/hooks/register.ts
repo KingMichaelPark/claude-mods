@@ -1,40 +1,28 @@
 import type { EngineInterface, Register } from "claude-code";
 
-// Rex terminal integration for Claude Code. Three features, all active only
-// when Claude runs in a Rex terminal (the third is below, at registerBgTabs:
-// a tab that follows each background command's output):
+// Rex terminal integration for Claude Code. Two features, both active only
+// when Claude runs in a Rex terminal.
 //
-// Approvals. When a Bash call would stop for your approval, this mod asks you
-// in Claude's own chat instead, and runs the command you approve in a Rex pane
-// below Claude's, as you, one time (or opens it there for you to edit first).
-// Claude gets the exit code and the output, and any note you add. If you say
-// no, or press Ctrl-C at any point, Claude gets nothing: its turn ends and it
-// waits for you. The pane stays open so you can read the output.
+// Approval pane. When Claude (or a sub-agent) wants to run a Bash command
+// outside the sandbox and no allow rule covers it, a short-lived Rex pane
+// opens below Claude's with the command in an editable prompt. Enter runs it
+// there, as you, one time; Ctrl-O moves it into nvim first; Ctrl-C, closing
+// the pane, or replacing the command with "# a reason" skips it. The mod reads
+// the output with `rex capture`, closes the pane, and gives Claude the exit
+// code and the output, or tells it plainly that you skipped the command.
+// Nothing runs without your Enter.
 //
-// rex auto (/rex auto on) is a switch of its own, apart from Claude Code's
-// auto mode: with it on, these commands run in the pane with no question and
-// the pane closes itself when the command ends.
-//
-// Agent tabs. Each sub-agent Claude starts gets its own Rex tab in Claude's
-// session: a live log of its prompt, its text, every tool call and result, and
-// its final report. The tab's name and Rex status show whether it is working,
-// finished or failed. The agent still runs inside Claude Code, so results,
-// SendMessage and model routing work as before; the tab only shows the work.
-// A tab whose agent finishes cleanly closes itself after a short countdown
+// Agent tabs. Each sub-agent gets its own Rex tab in Claude's session: a live
+// log of its prompt, its text, every tool call and result, and its final
+// report. The agent still runs inside Claude Code; the tab only shows the
+// work. A tab whose agent finishes cleanly closes itself after a countdown
 // (press a key in it to keep it); a failed or interrupted agent's tab stays.
 
 type On = Parameters<Register>[0];
 
-type Mode = "ask" | "unsandboxed" | "off";
-const MODES: readonly Mode[] = ["ask", "unsandboxed", "off"];
-const MODE_KEY = "approve.mode";
-// "on": rex auto. Approval panes run the command at once, without asking, and
-// close themselves. Not Claude Code's auto mode, which it does not read.
-const AUTORUN_KEY = "approve.autorun";
+// Store keys. Both features are on unless set to "off".
+const APPROVE_KEY = "approve";
 const TABS_KEY = "tabs";
-const AUTOCLOSE_KEY = "agents.autoclose";
-// Seconds a finished agent's tab waits before it closes itself.
-const AUTOCLOSE_S = 5;
 
 // How long one `rex wait` runs before we look at next.signal again.
 const WAIT_SLICE_S = 15;
@@ -42,54 +30,14 @@ const WAIT_SLICE_S = 15;
 const MAX_WAIT_MS = 60 * 60 * 1000;
 // The most captured output handed to Claude (its tail is kept).
 const MAX_OUTPUT_CHARS = 30_000;
+// Seconds a finished agent's tab waits before it closes itself.
+const AUTOCLOSE_S = 5;
 
 type Rex = { session: string; block: string };
-type Outcome =
-    | { kind: "closed" }
-    | { kind: "cancelled" }
-    | { kind: "stopped" }
-    | { kind: "timeout" }
-    | { kind: "interrupted" }
-    | {
-          kind: "ran";
-          command: string;
-          exitCode: string;
-          output: string;
-          note: string;
-          how: How;
-      };
 
-// How a command that ran was approved: by rex auto, in the chat, or in the
-// pane (after editing it there).
-type How = "auto" | "chat" | "pane";
-
-// The main loop's running turn, which a cancelled approval ends.
-let mainTurnId: string | undefined;
-
-const isMode = (s: string): s is Mode =>
-    (MODES as readonly string[]).includes(s);
-
-const getMode = async ($: EngineInterface): Promise<Mode> => {
-    const raw = (await $.store.get(MODE_KEY).catch(() => undefined)) as
-        | string
-        | undefined;
-
-    return raw !== undefined && isMode(raw) ? raw : "unsandboxed";
-};
-
-const autorunOn = async ($: EngineInterface) =>
-    ((await $.store.get(AUTORUN_KEY).catch(() => undefined)) as
-        | string
-        | undefined) === "on";
-
-const showStatus = ($: EngineInterface, mode: Mode) =>
-    $.ui.status(
-        mode === "unsandboxed"
-            ? undefined
-            : mode === "off"
-              ? "rex approve: off"
-              : "rex approve: every approval",
-    );
+const isOn = async ($: EngineInterface, key: string) =>
+    ((await $.store.get(key).catch(() => undefined)) as string | undefined) !==
+    "off";
 
 const rex = ($: EngineInterface, args: readonly string[], timeoutMs = 15_000) =>
     $.process.run(["rex", ...args], { timeoutMs });
@@ -104,132 +52,18 @@ const where = async ($: EngineInterface): Promise<Rex | undefined> => {
     return session && block ? { session, block } : undefined;
 };
 
-// The text between the wrapper's begin and end markers for run `n` in a capture.
-const sliceOutput = (screen: string, id: string, n: number, budget: number) => {
-    const begin = `⟦rex:${id}:begin:${n}⟧`;
-    const end = `⟦rex:${id}:end:${n}⟧`;
-    const from = screen.lastIndexOf(begin);
-    const to = screen.lastIndexOf(end);
-    if (from === -1) return "(output not found in the pane)";
-    const body = screen
-        .slice(from + begin.length, to > from ? to : undefined)
-        .replace(/^\n/, "")
-        .trimEnd();
+const tempDir = async ($: EngineInterface, prefix: string) => {
+    const made = await $.process.run(["mktemp", "-d", "-t", prefix]);
+    const dir = made.stdout.trim();
+    if (made.exitCode !== 0 || dir === "") throw new Error("mktemp failed");
 
-    return body.length > budget
-        ? `[first ${body.length - budget} characters left out]\n${body.slice(-budget)}`
-        : body;
+    return dir;
 };
 
-// Waits until the wrapper writes its status, the pane goes away, Claude's turn
-// is interrupted, or we give up.
-const waitForPane = async (
-    $: EngineInterface,
-    r: Rex,
-    paneId: string,
-    dir: string,
-    signal: AbortSignal,
-): Promise<"done" | "gone" | "timeout" | "interrupted"> => {
-    const started = await $.clock.now();
-    for (;;) {
-        if (await $.fs.exists(`${dir}/status`)) return "done";
-        if (signal.aborted) return "interrupted";
-        if ((await $.clock.now()) - started > MAX_WAIT_MS) return "timeout";
-        const sliceStart = await $.clock.now();
-        await rex(
-            $,
-            ["wait", "-s", r.session, paneId, "--for", `${WAIT_SLICE_S}s`],
-            (WAIT_SLICE_S + 15) * 1000,
-        ).catch(() => undefined);
-        if (await $.fs.exists(`${dir}/status`)) return "done";
-        // `rex wait` returned well before its slice ran out: the wrapper exited
-        // (or the pane was closed) without writing a status.
-        if ((await $.clock.now()) - sliceStart < (WAIT_SLICE_S - 2) * 1000)
-            return "gone";
-    }
-};
-
-const readOutcome = async (
-    $: EngineInterface,
-    r: Rex,
-    paneId: string,
-    dir: string,
-    id: string,
-    how: How,
-): Promise<Outcome> => {
-    const status = await readFile($, `${dir}/status`);
-    if (status === "cancelled") return { kind: "cancelled" };
-    if (status === "stopped") return { kind: "stopped" };
-    // No status: the pane was closed, before or after the command ran. Both
-    // send nothing, as Ctrl-C does.
-    if (status !== "ran") return { kind: "closed" };
-    const cap = await rex($, [
-        "block",
-        "capture",
-        "-s",
-        r.session,
-        "-b",
-        paneId,
-        "--trim",
-        "--unwrap",
-    ]);
-
-    return {
-        kind: "ran",
-        command: await readFile($, `${dir}/run.cmd`),
-        exitCode: await readFile($, `${dir}/rc`),
-        output:
-            cap.exitCode === 0
-                ? sliceOutput(cap.stdout, id, 1, MAX_OUTPUT_CHARS)
-                : "(the pane could not be captured)",
-        note: await readFile($, `${dir}/note`),
-        how,
-    };
-};
-
-const describe = (o: Outcome, proposed: string): string => {
-    switch (o.kind) {
-        case "cancelled":
-            return "The user reviewed this command and chose not to run it. Stop and wait for the user's direction.";
-        case "stopped":
-            return "The user stopped this command with Ctrl-C in the Rex terminal pane and chose not to share the result. Stop and wait for the user's direction.";
-        case "closed":
-            return "The user closed the Rex approval pane and shared nothing. Stop and wait for the user's direction.";
-        case "timeout":
-            return "The user did not act on the Rex approval pane within an hour; the command was not run.";
-        case "interrupted":
-            return "The turn was interrupted while the Rex approval pane was open; the command was not run.";
-        case "ran": {
-            const who =
-                o.how === "auto"
-                    ? "This command ran automatically in a Rex terminal pane (the user turned on rex auto)."
-                    : o.how === "chat"
-                      ? "The user approved this command and it ran in a Rex terminal pane, as the user."
-                      : "The user ran this command themselves in a Rex terminal pane.";
-            const lines = [`${who} Exit code: ${o.exitCode || "unknown"}.`];
-            if (o.command && o.command !== proposed.trim())
-                lines.push(
-                    `They edited it first. The command they ran was:\n${o.command}`,
-                );
-            lines.push(`Output:\n${o.output || "(no output)"}`);
-            if (o.note) lines.push(`The user added a note:\n${o.note}`);
-
-            return lines.join("\n\n");
-        }
-    }
-};
+const removeDir = ($: EngineInterface, dir: string) =>
+    $.process.run(["rm", "-rf", dir]).catch(() => undefined);
 
 // ------------------------------------------------------------- agent tabs
-
-const tabsOn = async ($: EngineInterface) =>
-    ((await $.store.get(TABS_KEY).catch(() => undefined)) as
-        | string
-        | undefined) !== "off";
-
-const autocloseOn = async ($: EngineInterface) =>
-    ((await $.store.get(AUTOCLOSE_KEY).catch(() => undefined)) as
-        | string
-        | undefined) !== "off";
 
 // The most of a prompt, a text or a report shown in a tab.
 const MAX_BLOCK_CHARS = 8_000;
@@ -343,7 +177,7 @@ const summarise = (tool: string, input: Record<string, unknown>): string => {
 // What `tool.call`'s next(e) resolves to, as far as the log needs it.
 type LooseResult = { deny?: string; isError?: true; text?: string };
 
-const outcome = (tool: string, r: LooseResult, ms: number) => {
+const outcomeLine = (tool: string, r: LooseResult, ms: number) => {
     const took = dim(` · ${seconds(ms)}`);
     if (r.deny) return `  ${red("✗")} ${tool} denied: ${oneLine(r.deny)}${took}`;
     if (r.isError)
@@ -394,14 +228,11 @@ const openTab = async (
     title: string,
     teammate: boolean,
 ): Promise<AgentTab> => {
-    const made = await $.process.run(["mktemp", "-d", "-t", "rex-agent"]);
-    const dir = made.stdout.trim();
-    if (made.exitCode !== 0 || dir === "") throw new Error("mktemp failed");
+    const dir = await tempDir($, "rex-agent");
     await $.fs.write(`${dir}/title`, title);
     await $.fs.write(`${dir}/state`, "working");
     // Teammates go idle between turns rather than finishing, so never close.
-    if (!teammate && (await autocloseOn($)))
-        await $.fs.write(`${dir}/autoclose`, String(AUTOCLOSE_S));
+    if (!teammate) await $.fs.write(`${dir}/autoclose`, String(AUTOCLOSE_S));
     const label = oneLine(title, MAX_LABEL_CHARS);
     const tab: AgentTab = {
         dir,
@@ -415,7 +246,7 @@ const openTab = async (
     // Tracked before the tab opens: the agent is already running, and what it
     // does meanwhile waits in the directory for the viewer.
     tabs.set(agentId, tab);
-    const made2 = await rex($, [
+    const made = await rex($, [
         "window",
         "new",
         "-s",
@@ -430,13 +261,12 @@ const openTab = async (
         `${$.plugin.root}/scripts/agent-view.zsh`,
         dir,
     ]);
-    if (made2.exitCode !== 0) {
+    if (made.exitCode !== 0) {
         tabs.delete(agentId);
-        await $.process.run(["rm", "-rf", dir]).catch(() => undefined);
-        throw new Error(made2.stderr || "rex window new failed");
+        await removeDir($, dir);
+        throw new Error(made.stderr || "rex window new failed");
     }
-    tab.windowId = (JSON.parse(made2.stdout) as { window_id?: string })
-        .window_id;
+    tab.windowId = (JSON.parse(made.stdout) as { window_id?: string }).window_id;
 
     return tab;
 };
@@ -462,7 +292,7 @@ const registerAgentTabs = (on: On) => {
 
                 return res;
             }
-            if (!(await tabsOn($))) return res;
+            if (!(await isOn($, TABS_KEY))) return res;
             const r = await where($);
             if (r === undefined) return res;
             const title = e.name || e.description || e.subagentType;
@@ -496,12 +326,8 @@ const registerAgentTabs = (on: On) => {
         return res;
     }).catch(($, e, next) => next(e)); // the tab is only a view: never block the agent
 
-    // A teammate woken by a message starts a new turn in the same tab. The
-    // main loop's turn is remembered, so a cancelled approval can end it.
-    // (One turn.start hook for the module: the engine refuses a second one
-    // without a matcher.)
+    // A teammate woken by a message starts a new turn in the same tab.
     on("turn.start", async ($, e, next) => {
-        if (e.agentId === undefined) mainTurnId = e.turnId;
         const tab = e.agentId ? tabs.get(e.agentId) : undefined;
         if (tab) await setState($, tab, "working");
 
@@ -531,7 +357,7 @@ const registerAgentTabs = (on: On) => {
         void emit(
             $,
             tab,
-            outcome(
+            outcomeLine(
                 e.tool,
                 res as unknown as LooseResult,
                 (await $.clock.now()) - started,
@@ -581,250 +407,186 @@ const registerAgentTabs = (on: On) => {
     });
 };
 
-// ------------------------------------------------- background command tabs
+// ----------------------------------------------------------- approval pane
 
-// Each Bash command Claude runs in the background (or moves there with
-// Ctrl+B or a timeout) gets a Rex tab that follows its output file. Claude
-// Code still runs the command, in its sandbox: the tab only shows the output,
-// and Ctrl-C in it can stop the command.
+type Outcome =
+    | { kind: "skipped"; note: string }
+    | { kind: "timeout" }
+    | { kind: "interrupted" }
+    | {
+          kind: "ran";
+          command: string;
+          exitCode: string;
+          output: string;
+          stopped: boolean;
+      };
 
-const BG_KEY = "bg";
+// The text between the pane script's begin and end markers in a capture.
+const sliceOutput = (screen: string, id: string) => {
+    const begin = `⟦rex:${id}:begin⟧`;
+    const end = `⟦rex:${id}:end⟧`;
+    const from = screen.lastIndexOf(begin);
+    const to = screen.lastIndexOf(end);
+    if (from === -1) return "(output not found in the pane)";
+    const body = screen
+        .slice(from + begin.length, to > from ? to : undefined)
+        .replace(/^\n/, "")
+        .trimEnd();
 
-const bgOn = async ($: EngineInterface) =>
-    ((await $.store.get(BG_KEY).catch(() => undefined)) as
-        | string
-        | undefined) !== "off";
-
-type BgTab = {
-    dir: string;
-    session: string;
-    windowId?: string;
-    label: string;
+    return body.length > MAX_OUTPUT_CHARS
+        ? `[first ${body.length - MAX_OUTPUT_CHARS} characters left out]\n${body.slice(-MAX_OUTPUT_CHARS)}`
+        : body;
 };
 
-// The open tabs by background task id.
-const bgTabs = new Map<string, BgTab>();
-
-// What a Bash call's next(e) resolves to, as far as this needs it.
-type LooseBash = {
-    text?: string;
-    result?: { backgroundTaskId?: string; backgroundOutputPath?: string };
-};
-
-const OUTPUT_PATH = /Output is being written to: (\S+?\.output)\b/;
-
-const openBgTab = async (
+// Waits until the pane script writes its status, the pane goes away, Claude's
+// turn is interrupted, or we give up.
+const waitForPane = async (
     $: EngineInterface,
     r: Rex,
-    taskId: string,
-    output: string,
-    command: string,
-    title: string,
-) => {
-    const made = await $.process.run(["mktemp", "-d", "-t", "rex-bg"]);
-    const dir = made.stdout.trim();
-    if (made.exitCode !== 0 || dir === "") throw new Error("mktemp failed");
-    await $.fs.write(`${dir}/output`, output);
-    await $.fs.write(`${dir}/command`, command);
-    await $.fs.write(`${dir}/title`, title);
-    const label = oneLine(`$ ${title || command}`, MAX_LABEL_CHARS);
-    const tab: BgTab = { dir, session: r.session, label };
-    bgTabs.set(taskId, tab);
-    const opened = await rex($, [
-        "window",
-        "new",
+    paneId: string,
+    dir: string,
+    signal: AbortSignal,
+): Promise<"done" | "gone" | "timeout" | "interrupted"> => {
+    const started = await $.clock.now();
+    for (;;) {
+        if (await $.fs.exists(`${dir}/status`)) return "done";
+        if (signal.aborted) return "interrupted";
+        if ((await $.clock.now()) - started > MAX_WAIT_MS) return "timeout";
+        const sliceStart = await $.clock.now();
+        const waited = await rex(
+            $,
+            ["wait", "-s", r.session, paneId, "--for", `${WAIT_SLICE_S}s`],
+            (WAIT_SLICE_S + 15) * 1000,
+        ).catch(() => undefined);
+        if (await $.fs.exists(`${dir}/status`)) return "done";
+        // You closed the pane ("block … closed", "… not found"), or `rex wait`
+        // returned well before its slice ran out: the script is gone without
+        // a status.
+        if (
+            /closed|not found/.test(waited?.stderr ?? "") ||
+            (await $.clock.now()) - sliceStart < (WAIT_SLICE_S - 2) * 1000
+        )
+            return "gone";
+    }
+};
+
+const readOutcome = async (
+    $: EngineInterface,
+    r: Rex,
+    paneId: string,
+    dir: string,
+    id: string,
+): Promise<Outcome> => {
+    // No status: you closed the pane. Whatever had started is not reported.
+    if ((await readFile($, `${dir}/status`)) !== "ran")
+        return { kind: "skipped", note: await readFile($, `${dir}/note`) };
+    const cap = await rex($, [
+        "capture",
         "-s",
         r.session,
-        `${MARKS.working} ${label}`,
-        "--focus=false",
-        "--json",
-        "-c",
-        await $.session.cwd(),
-        "--",
-        "/bin/zsh",
-        `${$.plugin.root}/scripts/bg-view.zsh`,
-        dir,
+        "-b",
+        paneId,
+        "--trim",
+        "--unwrap",
     ]);
-    if (opened.exitCode !== 0) {
-        bgTabs.delete(taskId);
-        await $.process.run(["rm", "-rf", dir]).catch(() => undefined);
-        throw new Error(opened.stderr || "rex window new failed");
-    }
-    tab.windowId = (JSON.parse(opened.stdout) as { window_id?: string })
-        .window_id;
+
+    return {
+        kind: "ran",
+        command: await readFile($, `${dir}/run.cmd`),
+        exitCode: await readFile($, `${dir}/rc`),
+        output:
+            cap.exitCode === 0
+                ? sliceOutput(cap.stdout, id)
+                : "(the pane could not be captured)",
+        stopped: await $.fs.exists(`${dir}/interrupted`),
+    };
 };
 
-// Records a background task's end in its tab: the exit file for the viewer,
-// and a mark on the tab's name.
-const endBgTab = async (
-    $: EngineInterface,
-    taskId: string,
-    status: string,
-    code: string | undefined,
-) => {
-    const tab = bgTabs.get(taskId);
-    if (tab === undefined) return;
-    bgTabs.delete(taskId);
-    if (!(await $.fs.exists(tab.dir))) return; // the tab was closed
-    await $.fs.write(`${tab.dir}/exit`, code ? `${status} ${code}` : status);
-    const mark =
-        status === "completed" && (code === undefined || code === "0")
-            ? MARKS.done
-            : status === "completed" || status === "failed"
-              ? MARKS.error
-              : MARKS.aborted;
-    if (tab.windowId)
-        await rex($, [
-            "window",
-            "rename",
-            "-s",
-            tab.session,
-            tab.windowId,
-            `${mark} ${tab.label}`,
-        ]).catch(() => undefined);
-};
+const describe = (o: Outcome, proposed: string): string => {
+    switch (o.kind) {
+        case "skipped":
+            return [
+                "SKIPPED BY THE USER. This command did not run. The user looked at it in the Rex approval pane and chose not to run it, because something about it is wrong.",
+                o.note
+                    ? `Their reason:\n${o.note}`
+                    : "They gave no reason.",
+                "Do not retry this command or a variant of it, and do not look for another route to the same effect. " +
+                    (o.note
+                        ? "Act on their reason; if it does not tell you what to do instead, ask them."
+                        : "Ask the user what is wrong and what they want instead."),
+            ].join("\n\n");
+        case "timeout":
+            return "The user did not act on the Rex approval pane within an hour; the command was not run.";
+        case "interrupted":
+            return "The turn was interrupted while the Rex approval pane was open; the command was not run.";
+        case "ran": {
+            const lines = [
+                `The user approved this command and it ran in a Rex terminal pane, as the user, outside the sandbox. Exit code: ${o.exitCode || "unknown"}.`,
+            ];
+            if (o.command && o.command !== proposed.trim())
+                lines.push(
+                    `The user edited it first. The command that ran was:\n${o.command}`,
+                );
+            if (o.stopped)
+                lines.push(
+                    "The user pressed Ctrl-C while it ran, so the output may be incomplete.",
+                );
+            lines.push(`Output:\n${o.output || "(no output)"}`);
 
-const NOTIFICATION = /<task-notification>([\s\S]*?)<\/task-notification>/g;
-
-// Marks the end of each tracked background task a notification text reports.
-const endBgTabsFrom = async ($: EngineInterface, raw: string) => {
-    if (bgTabs.size === 0 || !raw.includes("task-notification")) return;
-    for (const [, body = ""] of raw.matchAll(NOTIFICATION)) {
-        const id = /<task-id>([^<]+)<\/task-id>/.exec(body)?.[1];
-        const status = /<status>([^<]+)<\/status>/.exec(body)?.[1];
-        if (!id || !status || !bgTabs.has(id)) continue;
-        const code = /exit code (\d+)/.exec(body)?.[1];
-        await endBgTab($, id, status, code).catch(() => undefined);
-    }
-};
-
-const registerBgTabs = (on: On) => {
-    on("tool.call", { tool: "Bash" }, async ($, e, next) => {
-        const res = await next(e);
-        const loose = res as unknown as LooseBash;
-        const taskId = loose.result?.backgroundTaskId;
-        // A command kept on another machine has no output file here.
-        if (!taskId || loose.result?.backgroundOutputPath) return res;
-        try {
-            const output = OUTPUT_PATH.exec(loose.text ?? "")?.[1];
-            if (!output || !(await bgOn($))) return res;
-            const r = await where($);
-            if (r === undefined) return res;
-            await openBgTab($, r, taskId, output, e.command, e.description ?? "");
-        } catch (err) {
-            $.ui.log(
-                `could not open a Rex tab for the background command: ${String(err)}`,
-                { to: "debug" },
-            );
+            return lines.join("\n\n");
         }
+    }
+};
 
-        return res;
-    }).catch(($, e, next) => next(e)); // the tab is only a view
+// One approval pane at a time: calls that arrive together queue here.
+let queue: Promise<unknown> = Promise.resolve();
+const inTurn = <T>(work: () => Promise<T>): Promise<T> => {
+    const mine = queue.then(work, work);
+    queue = mine.catch(() => undefined);
 
-    // A background task's end reaches the conversation as a notification,
-    // which carries its status and exit code. It is submitted as a prompt
-    // (origin task-notification), then appended to the session. Both are
-    // hooked: an organisation's plugin can send session.append on past this
-    // mod's hook. endBgTab forgets a task once handled, so it runs once.
-    on("prompt.submit", async ($, e, next) => {
-        if (e.origin.kind === "task-notification")
-            await endBgTabsFrom($, e.text).catch(() => undefined);
-
-        return next(e);
-    }).catch(($, e, next) => next(e));
-
-    on("session.append", async ($, e, next) => {
-        if (bgTabs.size > 0)
-            await endBgTabsFrom($, JSON.stringify(e.message.content));
-
-        return next(e);
-    }).catch(($, e, next) => next(e));
+    return mine;
 };
 
 const HELP = [
-    "Usage: /rex [status | agents <on|off> | autoclose <on|off> | bg <on|off> | approve <mode> | auto <on|off>]",
-    "  agents on|off        a Rex tab for each sub-agent, to watch it work (default on)",
-    `  autoclose on|off     close a sub-agent's tab ${AUTOCLOSE_S}s after it finishes cleanly (default on)`,
-    "  bg on|off            a Rex tab for each background command, following its output (default on)",
-    "  approve unsandboxed  commands that leave the sandbox and need approval: you approve in the chat, they run in a Rex pane (default)",
-    "  approve ask          the same for every Bash command that needs approval",
-    "  approve off          use the normal approval dialog",
-    "  auto on|off          rex auto: those commands run in a Rex pane with no question, and the pane closes itself (default off; separate from Claude Code's auto mode)",
+    "Usage: /rex [status | on | off | agents on|off]",
+    "  on|off         the approval pane: commands that leave the sandbox open in a Rex pane for you to run, edit or skip (default on; off uses the normal approval dialog)",
+    "  agents on|off  a Rex tab for each sub-agent, to watch it work (default on)",
 ].join("\n");
 
-const statusText = async ($: EngineInterface) => {
-    const inRex = (await where($)) !== undefined;
-
-    return [
-        `rex agents: ${(await tabsOn($)) ? "on" : "off"}`,
-        `rex autoclose: ${(await autocloseOn($)) ? "on" : "off"}`,
-        `rex bg: ${(await bgOn($)) ? "on" : "off"}`,
-        `rex approve: ${await getMode($)}`,
-        `rex auto: ${(await autorunOn($)) ? "on" : "off"}`,
-        ...(inRex ? [] : ["(not in a Rex terminal, so inactive)"]),
+const statusText = async ($: EngineInterface) =>
+    [
+        `rex approval pane: ${(await isOn($, APPROVE_KEY)) ? "on" : "off"}`,
+        `rex agent tabs: ${(await isOn($, TABS_KEY)) ? "on" : "off"}`,
+        ...((await where($)) ? [] : ["(not in a Rex terminal, so inactive)"]),
     ].join("\n");
-};
 
 export const register: Register = (on) => {
     registerAgentTabs(on);
-    registerBgTabs(on);
 
     on("session.start", async ($, e, next) => {
         await $.command.register({
             name: "rex",
             description:
-                "Rex tabs for sub-agents and background commands, and Rex approvals",
-            argumentHint:
-                "[status|agents on|off|autoclose on|off|bg on|off|approve <mode>|auto on|off]",
+                "Rex approval pane for commands that leave the sandbox, and Rex tabs for sub-agents",
+            argumentHint: "[status|on|off|agents on|off]",
         });
-        showStatus($, await getMode($));
 
         return next(e);
     });
 
     on("command.run", { command: "rex" }, async ($, e) => {
-        const [what = "", value = "", extra = ""] = e.args
-            .trim()
-            .toLowerCase()
-            .split(/\s+/);
+        const [what = "", value = ""] = e.args.trim().toLowerCase().split(/\s+/);
         if (what === "" || what === "status")
             return { text: `${await statusText($)}\n\n${HELP}` };
-        // `approve auto on|off` is the older spelling of `auto on|off`.
-        const autoSwitch =
-            what === "auto"
-                ? value
-                : what === "approve" && value === "auto"
-                  ? extra
-                  : "";
-        if (autoSwitch === "on" || autoSwitch === "off") {
-            await $.store.set(AUTORUN_KEY, autoSwitch);
+        if (what === "on" || what === "off") {
+            await $.store.set(APPROVE_KEY, what);
 
-            return {
-                text:
-                    autoSwitch === "on"
-                        ? "rex auto on: approval commands run in a Rex pane with no question, and the pane closes itself."
-                        : "rex auto off: you approve each command in the chat, and its pane stays open.",
-            };
+            return { text: `rex approval pane ${what}.` };
         }
-        if (what === "approve" && isMode(value)) {
-            await $.store.set(MODE_KEY, value);
-            showStatus($, value);
+        if (what === "agents" && (value === "on" || value === "off")) {
+            await $.store.set(TABS_KEY, value);
 
-            return { text: `rex approve set to ${value}.` };
-        }
-        if (
-            (what === "agents" || what === "bg" || what === "autoclose") &&
-            (value === "on" || value === "off")
-        ) {
-            const key =
-                what === "agents"
-                    ? TABS_KEY
-                    : what === "bg"
-                      ? BG_KEY
-                      : AUTOCLOSE_KEY;
-            await $.store.set(key, value);
-
-            return { text: `rex ${what} ${value}.` };
+            return { text: `rex agent tabs ${value}.` };
         }
 
         return { text: HELP };
@@ -833,184 +595,110 @@ export const register: Register = (on) => {
     // Hooked at tool.call, before the permission prompt: an organisation's
     // security plugin can keep PermissionRequest from reaching mods.
     on("tool.call", { tool: "Bash" }, async ($, e, next) => {
-        if (e.run_in_background) return next(e);
         const command = e.command;
+        // Background commands keep the normal approval dialog.
+        if (!e.dangerouslyDisableSandbox || e.run_in_background) return next(e);
         if (command.trim() === "") return next(e);
-        const mode = await getMode($);
-        if (mode === "off") return next(e);
-        if (mode === "unsandboxed" && !e.dangerouslyDisableSandbox)
-            return next(e);
+        if (!(await isOn($, APPROVE_KEY))) return next(e);
         const r = await where($);
         if (r === undefined) return next(e);
-        // Calls your allow rules cover still run directly.
+        // Calls your allow rules cover run directly; ones a rule denies are
+        // refused as usual.
         const verdict = await $.tool.check({
             tool: "Bash",
-            input: {
-                command,
-                dangerouslyDisableSandbox: e.dangerouslyDisableSandbox,
-            },
+            input: { command, dangerouslyDisableSandbox: true },
         });
         if (verdict.decision !== "ask") return next(e);
-        const input = { description: e.description };
 
-        // Ends the main turn, so Claude waits for you. A sub-agent's call is
-        // refused instead, and the agent is told to stop.
-        const endTurn = async () => {
-            if (e.agentId === undefined && mainTurnId !== undefined)
-                await $.turn
-                    .abort({ turnId: mainTurnId })
-                    .catch(() => undefined);
-        };
+        const agentTab = e.agentId ? tabs.get(e.agentId) : undefined;
+        if (agentTab)
+            void emit(
+                $,
+                agentTab,
+                yellow("  ⏸ waiting for you in the Rex approval pane"),
+            );
 
-        // The approval itself stays in the chat. rex auto skips it.
-        const auto = await autorunOn($);
-        let how: How = auto ? "auto" : "chat";
-        if (!auto) {
-            const RUN = "Run it in a Rex pane";
-            const RUN_AUTO = "Run it, and turn on rex auto";
-            const EDIT = "Edit it in a Rex pane first";
-            const NO = "Don't run it";
-            let answer: string;
+        return inTurn(async () => {
+            if (next.signal.aborted)
+                return { deny: describe({ kind: "interrupted" }, command) };
+
+            // Set up the pane. Anything failing up to here falls back to the
+            // normal dialog: nothing has run.
+            let dir: string | undefined;
+            let paneId: string;
+            let id: string;
             try {
-                answer = await $.ui.ask(
-                    [
-                        input.description || "Claude wants to run a command that needs your approval.",
-                        "",
-                        command,
-                        "",
-                        "Run it in a Rex pane, as you?",
-                    ].join("\n"),
-                    { header: "rex approve", options: [RUN, RUN_AUTO, EDIT, NO] },
-                );
-            } catch {
-                answer = NO; // dismissed
-            }
-            if (answer === RUN_AUTO) {
-                await $.store.set(AUTORUN_KEY, "on");
-                $.ui.log("rex auto on: approval commands now run with no question (/rex auto off to stop)");
-            }
-            if (answer === EDIT) how = "pane";
-            else if (answer !== RUN && answer !== RUN_AUTO) {
-                if (answer === NO) {
-                    await endTurn();
-
-                    return { deny: describe({ kind: "cancelled" }, command) };
-                }
-                // Text typed under "Other": not run, and Claude reads why.
-                return {
-                    deny: `The user did not run this command. They said:\n${answer}`,
+                dir = await tempDir($, "rex");
+                id = dir.split("/").pop() ?? "x";
+                await $.fs.write(`${dir}/command`, command);
+                if (e.description)
+                    await $.fs.write(`${dir}/description`, e.description);
+                if (e.agentId)
+                    await $.fs.write(`${dir}/who`, agentTab?.label ?? e.agentId);
+                const split = await rex($, [
+                    "split",
+                    "-s",
+                    r.session,
+                    "-b",
+                    r.block,
+                    "--split=below",
+                    "--ratio",
+                    "40",
+                    "--label",
+                    "approve",
+                    "--keep-open",
+                    "--json",
+                    "-c",
+                    await $.session.cwd(),
+                    "--",
+                    "/bin/zsh",
+                    `${$.plugin.root}/scripts/approve.zsh`,
+                    dir,
+                    id,
+                ]);
+                const created = JSON.parse(split.stdout) as {
+                    block_ids?: string[];
                 };
+                if (split.exitCode !== 0 || !created.block_ids?.[0])
+                    throw new Error(split.stderr || "rex split failed");
+                paneId = created.block_ids[0];
+            } catch (err) {
+                if (dir) await removeDir($, dir);
+                $.ui.log(
+                    `could not open a Rex pane, using the normal dialog: ${String(err)}`,
+                    { to: "debug" },
+                );
+
+                return next(e);
             }
-        }
 
-        // Set up the pane. Anything failing up to here falls back to the normal dialog.
-        let dir: string;
-        let paneId: string;
-        try {
-            const made = await $.process.run([
-                "mktemp",
-                "-d",
-                "-t",
-                "rex",
-            ]);
-            dir = made.stdout.trim();
-            if (made.exitCode !== 0 || dir === "")
-                throw new Error("mktemp failed");
-            await $.fs.write(`${dir}/command`, command);
-            if (input.description)
-                await $.fs.write(`${dir}/description`, input.description);
-            if (how !== "pane") await $.fs.write(`${dir}/runnow`, "");
-            if (how === "auto") await $.fs.write(`${dir}/autoclose`, "");
-            const id = dir.split("/").pop() ?? "x";
-            const split = await rex($, [
-                "split",
-                "-s",
-                r.session,
-                "-b",
-                r.block,
-                "--split=below",
-                "--ratio",
-                "40",
-                "--label",
-                "approve",
-                "--keep-open",
-                "--json",
-                "-c",
-                await $.session.cwd(),
-                "--",
-                "/bin/zsh",
-                `${$.plugin.root}/scripts/approve.zsh`,
-                dir,
-                id,
-            ]);
-            const created = JSON.parse(split.stdout) as {
-                block_ids?: string[];
-            };
-            if (split.exitCode !== 0 || !created.block_ids?.[0])
-                throw new Error(split.stderr || "rex split failed");
-            paneId = created.block_ids[0];
-        } catch (err) {
-            $.ui.log(
-                `could not open a Rex pane, using the normal dialog: ${String(err)}`,
-                { to: "debug" },
-            );
+            // From here on the command may have run, so never fall back to next(e).
+            $.ui.status("rex: waiting for you in the approval pane");
+            try {
+                const waited = await waitForPane($, r, paneId, dir, next.signal);
+                const outcome: Outcome =
+                    waited === "done" || waited === "gone"
+                        ? await readOutcome($, r, paneId, dir, id)
+                        : { kind: waited };
+                const text = describe(outcome, command);
+                if (outcome.kind !== "ran") return { deny: text };
 
-            return next(e);
-        }
-
-        // From here on the command may have run, so never fall back to next(e).
-        const id = dir.split("/").pop() ?? "x";
-        $.ui.status(
-            how === "pane"
-                ? "rex approve: waiting for you in the Rex pane"
-                : "rex approve: running in the Rex pane",
-        );
-        // With rex auto on, the pane closes once its output is read, before
-        // anything that can end the turn (and this hook with it). Otherwise a
-        // pane whose command ran (or was stopped) stays open for you to read
-        // and close; one where nothing ran still closes.
-        let paneClosed = false;
-        let keepPane = false;
-        const closePane = async () => {
-            if (paneClosed || keepPane) return;
-            paneClosed = true;
-            await rex($, ["block", "close", "-s", r.session, paneId]).catch(
-                () => undefined,
-            );
-        };
-        try {
-            const waited = await waitForPane($, r, paneId, dir, next.signal);
-            const outcome: Outcome =
-                waited === "done" || waited === "gone"
-                    ? await readOutcome($, r, paneId, dir, id, how)
-                    : { kind: waited };
-            keepPane =
-                how !== "auto" &&
-                (outcome.kind === "ran" || outcome.kind === "stopped");
-            await closePane();
-            const text = describe(outcome, command);
-            if (
-                outcome.kind === "cancelled" ||
-                outcome.kind === "stopped" ||
-                outcome.kind === "closed"
-            ) {
-                // Back to the prompt: Claude waits for you.
-                await endTurn();
-
-                return { deny: text };
+                return {
+                    result: { stdout: text, stderr: "", interrupted: false },
+                };
+            } catch (err) {
+                return {
+                    deny: `rex lost track of the approval pane (${String(err)}), so it is not known whether the command ran. Ask the user what happened.`,
+                };
+            } finally {
+                // The output is read by now: the pane has done its job.
+                await rex($, ["block", "close", "-s", r.session, paneId]).catch(
+                    () => undefined,
+                );
+                await removeDir($, dir);
+                $.ui.status(undefined);
             }
-            if (outcome.kind !== "ran") return { deny: text };
-
-            return { result: { stdout: text, stderr: "", interrupted: false } };
-        } catch (err) {
-            return {
-                deny: `rex lost track of the approval pane (${String(err)}). Ask the user what happened.`,
-            };
-        } finally {
-            await closePane();
-            await $.process.run(["rm", "-rf", dir]).catch(() => undefined);
-            showStatus($, await getMode($).catch(() => "unsandboxed" as const));
-        }
+        });
     }).catch(($, e, next) =>
         // Before next: nothing ran, so the normal approval path is safe. After it,
         // next(e) replays what it settled to and runs nothing twice.
