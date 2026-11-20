@@ -3,7 +3,8 @@
 #
 # Shows the command Claude wants to run. You can run it as it is, edit it
 # first, or cancel. It runs here, in this terminal, as you, one time. The
-# result goes back to Claude and the pane closes.
+# result goes back to Claude. In auto mode the pane then closes; otherwise it
+# stays open for you to read and close.
 #
 # Ctrl-C at any point (before the command runs, while it runs, or after it)
 # sends nothing: the mod ends Claude's turn and Claude waits for you.
@@ -40,6 +41,13 @@ autorun=0
 
 finish() {
   print -r -- $1 >| $dir/status
+  # In auto mode the mod reads this pane's output, then closes it and removes
+  # $dir. If it has not done so after a while (it was reloaded, or its hook
+  # was stopped), the pane closes itself. Out of auto mode, a pane whose
+  # command ran stays open for you to read and close.
+  if (( automode )) && [[ -n $REX_BLOCK ]] && (( $+commands[rex] )); then
+    ( sleep 20; [[ -d $dir ]] && rex block close $REX_BLOCK ) >/dev/null 2>&1 &!
+  fi
   exit 0
 }
 
@@ -236,5 +244,9 @@ fi
 
 run_it
 (( autorun )) || offer_note
-print -P "%F{8}Sent to Claude. This pane closes now.%f"
+if (( automode )); then
+  print -P "%F{8}Sent to Claude. This pane closes now.%f"
+else
+  print -P "%F{8}Sent to Claude. Close this pane when you're done with it.%f"
+fi
 finish ran

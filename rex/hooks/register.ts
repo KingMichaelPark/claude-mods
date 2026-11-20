@@ -10,7 +10,8 @@ import type { EngineInterface, Register } from "claude-code";
 // exit code and the output, and any note you add. If you cancel, or press
 // Ctrl-C at any point, Claude gets nothing: its turn ends and it waits for you.
 // In auto mode you can choose to auto-run these commands: the pane then runs
-// each one at once and closes itself.
+// each one at once. In auto mode the pane closes itself once the command
+// ends; otherwise it stays open so you can read the output.
 //
 // Agent tabs. Each sub-agent Claude starts gets its own Rex tab in Claude's
 // session: a live log of its prompt, its text, every tool call and result, and
@@ -487,8 +488,12 @@ const registerAgentTabs = (on: On) => {
         return res;
     }).catch(($, e, next) => next(e)); // the tab is only a view: never block the agent
 
-    // A teammate woken by a message starts a new turn in the same tab.
+    // A teammate woken by a message starts a new turn in the same tab. The
+    // main loop's turn is remembered, so a cancelled approval can end it.
+    // (One turn.start hook for the module: the engine refuses a second one
+    // without a matcher.)
     on("turn.start", async ($, e, next) => {
+        if (e.agentId === undefined) mainTurnId = e.turnId;
         const tab = e.agentId ? tabs.get(e.agentId) : undefined;
         if (tab) await setState($, tab, "working");
 
@@ -773,12 +778,6 @@ export const register: Register = (on) => {
 
         return next(e);
     });
-    on("turn.start", ($, e, next) => {
-        if (e.agentId === undefined) mainTurnId = e.turnId;
-
-        return next(e);
-    });
-
     on("session.start", async ($, e, next) => {
         await $.command.register({
             name: "rex",
@@ -911,6 +910,20 @@ export const register: Register = (on) => {
         // From here on the command may have run, so never fall back to next(e).
         const id = dir.split("/").pop() ?? "x";
         $.ui.status("rex approve: waiting for you in the Rex pane");
+        // In auto mode the pane closes once its output is read, before anything
+        // that can end the turn (and this hook with it). Out of auto mode, a
+        // pane whose command ran (or was stopped) stays open for you to read
+        // and close; one where nothing ran still closes.
+        const inAutoMode = await $.fs.exists(`${dir}/automode`);
+        let paneClosed = false;
+        let keepPane = false;
+        const closePane = async () => {
+            if (paneClosed || keepPane) return;
+            paneClosed = true;
+            await rex($, ["block", "close", "-s", r.session, paneId]).catch(
+                () => undefined,
+            );
+        };
         try {
             const auto = await $.fs.exists(`${dir}/autorun`);
             const waited = await waitForPane($, r, paneId, dir, next.signal);
@@ -924,6 +937,10 @@ export const register: Register = (on) => {
                 waited === "done" || waited === "gone"
                     ? await readOutcome($, r, paneId, dir, id, auto)
                     : { kind: waited };
+            keepPane =
+                !inAutoMode &&
+                (outcome.kind === "ran" || outcome.kind === "stopped");
+            await closePane();
             const text = describe(outcome, command);
             if (
                 outcome.kind === "cancelled" ||
@@ -948,11 +965,9 @@ export const register: Register = (on) => {
                 deny: `rex lost track of the approval pane (${String(err)}). Ask the user what happened.`,
             };
         } finally {
-            showStatus($, await getMode($));
-            await rex($, ["block", "close", "-s", r.session, paneId]).catch(
-                () => undefined,
-            );
+            await closePane();
             await $.process.run(["rm", "-rf", dir]).catch(() => undefined);
+            showStatus($, await getMode($).catch(() => "unsandboxed" as const));
         }
     }).catch(($, e, next) =>
         // Before next: nothing ran, so the normal approval path is safe. After it,
