@@ -6,9 +6,11 @@ import type { EngineInterface, Register } from "claude-code";
 //
 // Approvals. When a Bash call would stop for your approval, this mod opens a
 // Rex pane below Claude's with the command prefilled instead. You read it,
-// edit it if you like, and run it there yourself (or cancel). When the pane is
-// done, you pick what Claude learns: the captured output, the exit code alone,
-// or a summary you type. The output is only captured if you say so.
+// edit it if you like, and run it there yourself, one time. Claude gets the
+// exit code and the output, and any note you add. If you cancel, or press
+// Ctrl-C at any point, Claude gets nothing: its turn ends and it waits for you.
+// In auto mode you can choose to auto-run these commands: the pane then runs
+// each one at once and closes itself.
 //
 // Agent tabs. Each sub-agent Claude starts gets its own Rex tab in Claude's
 // session: a live log of its prompt, its text, every tool call and result, and
@@ -23,6 +25,8 @@ type On = Parameters<Register>[0];
 type Mode = "ask" | "unsandboxed" | "off";
 const MODES: readonly Mode[] = ["ask", "unsandboxed", "off"];
 const MODE_KEY = "approve.mode";
+// "on": in auto mode, approval panes run the command at once, without asking.
+const AUTORUN_KEY = "approve.autorun";
 const TABS_KEY = "tabs";
 const AUTOCLOSE_KEY = "agents.autoclose";
 // Seconds a finished agent's tab waits before it closes itself.
@@ -39,11 +43,22 @@ type Rex = { session: string; block: string };
 type Outcome =
     | { kind: "closed" }
     | { kind: "cancelled" }
+    | { kind: "stopped" }
     | { kind: "timeout" }
     | { kind: "interrupted" }
-    | { kind: "ran"; runs: Run[]; share: string; summary: string };
+    | {
+          kind: "ran";
+          command: string;
+          exitCode: string;
+          output: string;
+          note: string;
+          auto: boolean;
+      };
 
-type Run = { command: string; exitCode: string; output?: string };
+// Claude Code's permission mode, as the last classic hook input carried it.
+let permissionMode: string | undefined;
+// The main loop's running turn, which a cancelled approval ends.
+let mainTurnId: string | undefined;
 
 const isMode = (s: string): s is Mode =>
     (MODES as readonly string[]).includes(s);
@@ -55,6 +70,11 @@ const getMode = async ($: EngineInterface): Promise<Mode> => {
 
     return raw !== undefined && isMode(raw) ? raw : "unsandboxed";
 };
+
+const autorunOn = async ($: EngineInterface) =>
+    ((await $.store.get(AUTORUN_KEY).catch(() => undefined)) as
+        | string
+        | undefined) === "on";
 
 const showStatus = ($: EngineInterface, mode: Mode) =>
     $.ui.status(
@@ -129,95 +149,61 @@ const readOutcome = async (
     paneId: string,
     dir: string,
     id: string,
+    auto: boolean,
 ): Promise<Outcome> => {
     const status = await readFile($, `${dir}/status`);
     if (status === "cancelled") return { kind: "cancelled" };
-    // A pane that ended after running something, before you chose what to
-    // share, still ran it: report that, with the exit codes alone.
-    const hasRun = await $.fs.exists(`${dir}/runs`);
-    if (status !== "ran" && !hasRun) return { kind: "closed" };
-    const share = status === "ran" ? await readFile($, `${dir}/share`) : "code";
-    const count = Math.max(
-        1,
-        Number.parseInt(await readFile($, `${dir}/runs`), 10) || 1,
-    );
-    const runs: Run[] = [];
-    for (let n = 1; n <= count; n++)
-        runs.push({
-            command: await readFile($, `${dir}/run.${n}.cmd`),
-            exitCode: await readFile($, `${dir}/run.${n}.rc`),
-        });
-    // Only read the pane when you chose to share what it printed.
-    if (share === "output") {
-        const cap = await rex($, [
-            "block",
-            "capture",
-            "-s",
-            r.session,
-            "-b",
-            paneId,
-            "--trim",
-            "--unwrap",
-        ]);
-        const budget = Math.floor(MAX_OUTPUT_CHARS / runs.length);
-        runs.forEach((run, i) => {
-            run.output =
-                cap.exitCode === 0
-                    ? sliceOutput(cap.stdout, id, i + 1, budget)
-                    : "(the pane could not be captured)";
-        });
-    }
+    if (status === "stopped") return { kind: "stopped" };
+    // No status: the pane was closed, before or after the command ran. Both
+    // send nothing, as Ctrl-C does.
+    if (status !== "ran") return { kind: "closed" };
+    const cap = await rex($, [
+        "block",
+        "capture",
+        "-s",
+        r.session,
+        "-b",
+        paneId,
+        "--trim",
+        "--unwrap",
+    ]);
 
     return {
         kind: "ran",
-        runs,
-        share,
-        summary: await readFile($, `${dir}/summary`),
+        command: await readFile($, `${dir}/run.cmd`),
+        exitCode: await readFile($, `${dir}/rc`),
+        output:
+            cap.exitCode === 0
+                ? sliceOutput(cap.stdout, id, 1, MAX_OUTPUT_CHARS)
+                : "(the pane could not be captured)",
+        note: await readFile($, `${dir}/note`),
+        auto,
     };
 };
 
 const describe = (o: Outcome, proposed: string): string => {
     switch (o.kind) {
         case "cancelled":
-            return "The user reviewed this command in a Rex terminal pane and chose not to run it.";
+            return "The user reviewed this command in a Rex terminal pane and chose not to run it. Stop and wait for the user's direction.";
+        case "stopped":
+            return "The user stopped this command with Ctrl-C in the Rex terminal pane and chose not to share the result. Stop and wait for the user's direction.";
         case "closed":
-            return "The user closed the Rex approval pane without running this command.";
+            return "The user closed the Rex approval pane and shared nothing. Stop and wait for the user's direction.";
         case "timeout":
             return "The user did not act on the Rex approval pane within an hour; the command was not run.";
         case "interrupted":
             return "The turn was interrupted while the Rex approval pane was open; the command was not run.";
         case "ran": {
-            const [first, ...rest] = o.runs;
-            const lines = [
-                `The user ran this command themselves in a Rex terminal pane. Exit code: ${first?.exitCode || "unknown"}.`,
-            ];
-            if (first?.command && first.command !== proposed.trim())
+            const who = o.auto
+                ? "This command ran automatically in a Rex terminal pane (the user chose auto-run in auto mode)."
+                : "The user ran this command themselves in a Rex terminal pane.";
+            const lines = [`${who} Exit code: ${o.exitCode || "unknown"}.`];
+            if (o.command && o.command !== proposed.trim())
                 lines.push(
-                    `They edited it first. The command they ran was:\n${first.command}`,
+                    `They edited it first. The command they ran was:\n${o.command}`,
                 );
-            if (o.share === "output")
-                lines.push(`Output:\n${first?.output || "(no output)"}`);
-            if (rest.length > 0)
-                lines.push(
-                    `They then ran ${rest.length} follow-on command${rest.length > 1 ? "s" : ""} in the same pane:`,
-                    ...rest.map(
-                        (run, i) =>
-                            `Follow-on ${i + 1}: ${run.command}\nExit code: ${run.exitCode || "unknown"}` +
-                            (o.share === "output"
-                                ? `\nOutput:\n${run.output || "(no output)"}`
-                                : ""),
-                    ),
-                );
-            if (o.share === "summary")
-                lines.push(
-                    o.summary
-                        ? `They chose not to share the output. Their summary of the result:\n${o.summary}`
-                        : "They chose not to share the output and left the summary empty.",
-                );
-            else if (o.share !== "output")
-                lines.push(
-                    "They chose not to share the output; only the exit codes are known.",
-                );
+            lines.push(`Output:\n${o.output || "(no output)"}`);
+            if (o.note) lines.push(`The user added a note:\n${o.note}`);
 
             return lines.join("\n\n");
         }
@@ -743,13 +729,14 @@ const registerBgTabs = (on: On) => {
 };
 
 const HELP = [
-    "Usage: /rex [status | agents <on|off> | autoclose <on|off> | bg <on|off> | approve <mode>]",
+    "Usage: /rex [status | agents <on|off> | autoclose <on|off> | bg <on|off> | approve <mode> | approve auto <on|off>]",
     "  agents on|off        a Rex tab for each sub-agent, to watch it work (default on)",
     `  autoclose on|off     close a sub-agent's tab ${AUTOCLOSE_S}s after it finishes cleanly (default on)`,
     "  bg on|off            a Rex tab for each background command, following its output (default on)",
     "  approve unsandboxed  commands that leave the sandbox and need approval open in a Rex pane (default)",
     "  approve ask          every Bash command that needs approval (not for auto mode)",
     "  approve off          use the normal approval dialog",
+    "  approve auto on|off  in auto mode, approval panes run the command at once (default off)",
 ].join("\n");
 
 const statusText = async ($: EngineInterface) => {
@@ -760,6 +747,7 @@ const statusText = async ($: EngineInterface) => {
         `rex autoclose: ${(await autocloseOn($)) ? "on" : "off"}`,
         `rex bg: ${(await bgOn($)) ? "on" : "off"}`,
         `rex approve: ${await getMode($)}`,
+        `rex approve auto-run (auto mode): ${(await autorunOn($)) ? "on" : "off"}`,
         ...(inRex ? [] : ["(not in a Rex terminal, so inactive)"]),
     ].join("\n");
 };
@@ -768,13 +756,36 @@ export const register: Register = (on) => {
     registerAgentTabs(on);
     registerBgTabs(on);
 
+    // The permission mode reaches mods on the classic hooks' inputs. These
+    // fire often enough to follow a mode change (Shift+Tab) within a turn.
+    on("classic.SessionStart", ($, e, next) => {
+        permissionMode = e.permission_mode ?? permissionMode;
+
+        return next(e);
+    });
+    on("classic.UserPromptSubmit", ($, e, next) => {
+        permissionMode = e.permission_mode ?? permissionMode;
+
+        return next(e);
+    });
+    on("classic.PostToolUse", ($, e, next) => {
+        permissionMode = e.permission_mode ?? permissionMode;
+
+        return next(e);
+    });
+    on("turn.start", ($, e, next) => {
+        if (e.agentId === undefined) mainTurnId = e.turnId;
+
+        return next(e);
+    });
+
     on("session.start", async ($, e, next) => {
         await $.command.register({
             name: "rex",
             description:
                 "Rex tabs for sub-agents and background commands, and Rex approvals",
             argumentHint:
-                "[status|agents on|off|autoclose on|off|bg on|off|approve <mode>]",
+                "[status|agents on|off|autoclose on|off|bg on|off|approve <mode>|approve auto on|off]",
         });
         showStatus($, await getMode($));
 
@@ -782,9 +793,17 @@ export const register: Register = (on) => {
     });
 
     on("command.run", { command: "rex" }, async ($, e) => {
-        const [what = "", value = ""] = e.args.trim().toLowerCase().split(/\s+/);
+        const [what = "", value = "", extra = ""] = e.args
+            .trim()
+            .toLowerCase()
+            .split(/\s+/);
         if (what === "" || what === "status")
             return { text: `${await statusText($)}\n\n${HELP}` };
+        if (what === "approve" && value === "auto" && (extra === "on" || extra === "off")) {
+            await $.store.set(AUTORUN_KEY, extra);
+
+            return { text: `rex approve auto-run in auto mode ${extra}.` };
+        }
         if (what === "approve" && isMode(value)) {
             await $.store.set(MODE_KEY, value);
             showStatus($, value);
@@ -848,6 +867,10 @@ export const register: Register = (on) => {
             await $.fs.write(`${dir}/command`, command);
             if (input.description)
                 await $.fs.write(`${dir}/description`, input.description);
+            if (permissionMode === "auto") {
+                await $.fs.write(`${dir}/automode`, "");
+                if (await autorunOn($)) await $.fs.write(`${dir}/autorun`, "");
+            }
             const id = dir.split("/").pop() ?? "x";
             const split = await rex($, [
                 "split",
@@ -889,12 +912,34 @@ export const register: Register = (on) => {
         const id = dir.split("/").pop() ?? "x";
         $.ui.status("rex approve: waiting for you in the Rex pane");
         try {
+            const auto = await $.fs.exists(`${dir}/autorun`);
             const waited = await waitForPane($, r, paneId, dir, next.signal);
+            if (await $.fs.exists(`${dir}/always`)) {
+                await $.store.set(AUTORUN_KEY, "on");
+                $.ui.log(
+                    "rex: approval panes now auto-run in auto mode (/rex approve auto off to stop)",
+                );
+            }
             const outcome: Outcome =
                 waited === "done" || waited === "gone"
-                    ? await readOutcome($, r, paneId, dir, id)
+                    ? await readOutcome($, r, paneId, dir, id, auto)
                     : { kind: waited };
             const text = describe(outcome, command);
+            if (
+                outcome.kind === "cancelled" ||
+                outcome.kind === "stopped" ||
+                outcome.kind === "closed"
+            ) {
+                // Back to the prompt: end the main turn, so Claude waits for
+                // you. A sub-agent's call is refused instead, and the agent is
+                // told to stop.
+                if (e.agentId === undefined && mainTurnId !== undefined)
+                    await $.turn
+                        .abort({ turnId: mainTurnId })
+                        .catch(() => undefined);
+
+                return { deny: text };
+            }
             if (outcome.kind !== "ran") return { deny: text };
 
             return { result: { stdout: text, stderr: "", interrupted: false } };
