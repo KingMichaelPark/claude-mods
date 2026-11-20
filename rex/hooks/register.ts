@@ -547,6 +547,18 @@ const inTurn = <T>(work: () => Promise<T>): Promise<T> => {
     return mine;
 };
 
+const GUIDANCE = {
+    id: "rex:approval-pane",
+    scope: "session",
+    text: [
+        "# Running commands outside the sandbox in this Rex terminal",
+        "When a command has to run outside the sandbox, call Bash with that command itself and `dangerouslyDisableSandbox: true`. A Rex pane then opens for the user, who runs, edits or skips the command there. Its exit code and output come back as the tool result, and the pane closes by itself.",
+        "Do not use `rex split`, `rex run`, `rex window new` or `rex send` to run such a command in a pane of your own and then `rex capture` to read it: every `rex` call is itself a command outside the sandbox, so the user would have to approve the run, the read and the close one by one. One Bash call does all three.",
+        "Use `rex` directly only when the user asks for something to stay on screen (a tab, a split, a server, a monitor). Close any pane you opened and no longer need.",
+        "If the result says the user skipped the command, do not retry it or a variant.",
+    ].join("\n\n"),
+} as const;
+
 const HELP = [
     "Usage: /rex [status | on | off | agents on|off]",
     "  on|off         the approval pane: commands that leave the sandbox open in a Rex pane for you to run, edit or skip (default on; off uses the normal approval dialog)",
@@ -573,6 +585,18 @@ export const register: Register = (on) => {
 
         return next(e);
     });
+
+    // Without this, Claude leaves the sandbox by driving Rex by hand: it opens
+    // its own pane for the command, then asks again to read it, and leaves it
+    // open. Each of those `rex` calls needs its own approval.
+    on("prompt.compose", async ($, e, next) => {
+        const res = await next(e);
+        if (!e.tools.includes("Bash")) return res;
+        if ((await where($)) === undefined || !(await isOn($, APPROVE_KEY)))
+            return res;
+
+        return { sections: [...res.sections, GUIDANCE] };
+    }).catch(($, e, next) => next(e));
 
     on("command.run", { command: "rex" }, async ($, e) => {
         const [what = "", value = ""] = e.args.trim().toLowerCase().split(/\s+/);
