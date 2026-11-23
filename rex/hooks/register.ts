@@ -502,7 +502,26 @@ const readOutcome = async (
     };
 };
 
-const describe = (o: Outcome, proposed: string): string => {
+// The command inside a `rex split|run … -- COMMAND` call, or undefined.
+const unwrapRex = async ($: EngineInterface, command: string) => {
+    if (!/^\s*(\S*\/)?rex\s+(split|run)\b/.test(command)) return undefined;
+    const out = await $.process
+        .run(["/bin/zsh", "-f", `${$.plugin.root}/scripts/unwrap.zsh`, command])
+        .catch(() => undefined);
+    const inner = out?.exitCode === 0 ? out.stdout.replace(/\n$/, "") : "";
+
+    return inner.trim() === "" ? undefined : inner;
+};
+
+const UNWRAPPED_NOTE =
+    "Note: you wrapped this command in `rex split`/`rex run`. The Rex approval pane is already a split, so rex ran only the inner command there and opened no second pane. Next time call Bash with the command itself and `dangerouslyDisableSandbox: true`.";
+
+const describe = (o: Outcome, proposed: string, unwrapped = false): string =>
+    unwrapped
+        ? `${describeOutcome(o, proposed)}\n\n${UNWRAPPED_NOTE}`
+        : describeOutcome(o, proposed);
+
+const describeOutcome = (o: Outcome, proposed: string): string => {
     switch (o.kind) {
         case "skipped":
             return [
@@ -619,10 +638,9 @@ export const register: Register = (on) => {
     // Hooked at tool.call, before the permission prompt: an organisation's
     // security plugin can keep PermissionRequest from reaching mods.
     on("tool.call", { tool: "Bash" }, async ($, e, next) => {
-        const command = e.command;
         // Background commands keep the normal approval dialog.
         if (!e.dangerouslyDisableSandbox || e.run_in_background) return next(e);
-        if (command.trim() === "") return next(e);
+        if (e.command.trim() === "") return next(e);
         if (!(await isOn($, APPROVE_KEY))) return next(e);
         const r = await where($);
         if (r === undefined) return next(e);
@@ -630,9 +648,14 @@ export const register: Register = (on) => {
         // refused as usual.
         const verdict = await $.tool.check({
             tool: "Bash",
-            input: { command, dangerouslyDisableSandbox: true },
+            input: { command: e.command, dangerouslyDisableSandbox: true },
         });
         if (verdict.decision !== "ask") return next(e);
+        // `rex split -- CMD` would open a second pane under the approval
+        // pane: put CMD itself in the approval pane instead.
+        const inner = await unwrapRex($, e.command);
+        const command = inner ?? e.command;
+        const unwrapped = inner !== undefined;
 
         const agentTab = e.agentId ? tabs.get(e.agentId) : undefined;
         if (agentTab)
@@ -644,7 +667,9 @@ export const register: Register = (on) => {
 
         return inTurn(async () => {
             if (next.signal.aborted)
-                return { deny: describe({ kind: "interrupted" }, command) };
+                return {
+                    deny: describe({ kind: "interrupted" }, command, unwrapped),
+                };
 
             // Set up the pane. Anything failing up to here falls back to the
             // normal dialog: nothing has run.
@@ -697,14 +722,14 @@ export const register: Register = (on) => {
             }
 
             // From here on the command may have run, so never fall back to next(e).
-            $.ui.status("rex: waiting for you in the approval pane");
+            $.ui.status("waiting for you in the approval pane");
             try {
                 const waited = await waitForPane($, r, paneId, dir, next.signal);
                 const outcome: Outcome =
                     waited === "done" || waited === "gone"
                         ? await readOutcome($, r, paneId, dir, id)
                         : { kind: waited };
-                const text = describe(outcome, command);
+                const text = describe(outcome, command, unwrapped);
                 if (outcome.kind !== "ran") return { deny: text };
 
                 return {

@@ -1,5 +1,5 @@
 {
   "name": "rex",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Rex terminal integration: run, edit or skip commands that leave the sandbox in a short-lived Rex pane, and watch each sub-agent work in its own Rex tab"
 }
