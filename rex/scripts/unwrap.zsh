@@ -1,6 +1,7 @@
 #!/bin/zsh -f
 # Prints the command inside a `rex split … -- COMMAND` or `rex run … -- COMMAND`
-# call, ready to run in a shell. Exits 1 when $1 is not such a call.
+# call, ready to run in a shell. Reads the call on stdin. Exits 1 when it is
+# not such a call.
 #
 # Claude sometimes wraps a command that must leave the sandbox in its own
 # `rex split`. The approval pane is already a split, so the mod runs the inner
@@ -12,8 +13,12 @@
 emulate -L zsh
 setopt extended_glob
 
+local call=''
+IFS= read -r -d '' call
+# A trailing newline would split as a `;` and look like a shell operator.
+call=${call%%[[:space:]]##}
 local -a w
-w=(${(z)1})
+w=(${(z)call})
 (( $#w >= 4 )) || exit 1
 [[ ${(Q)w[1]} == (|*/)rex ]] || exit 1
 [[ ${(Q)w[2]} == (split|run) ]] || exit 1
